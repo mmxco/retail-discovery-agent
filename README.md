@@ -42,6 +42,43 @@ flowchart TD
 
 ---
 
+## Enterprise Production Architecture: CRM Webhook Trigger
+
+> [!TIP]
+> **Production Recommendation: Event-Driven CRM Automation**
+> 
+> While the Streamlit interface provides an interactive workbench for ad-hoc research, in a **true enterprise deployment** this pipeline would run as an automated, event-driven service triggered by your CRM:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Rep as Sales Rep / BDR
+    participant CRM as Salesforce / HubSpot
+    participant Gateway as Webhook / API Gateway
+    participant Worker as Discovery Pipeline Worker
+    participant Gemini as Gemini 2.5 Flash
+    participant GDocs as Google Docs API
+    participant Slack as Slack / Teams Channel
+
+    Rep->>CRM: Moves Opportunity to "Stage 1 - Discovery Scheduled"
+    CRM->>Gateway: POST /api/v1/trigger-discovery (Account URL, BDR Notes, Revenue, Stage)
+    Gateway->>Worker: Dispatch Async Job (Cloud Run / Celery / Lambda)
+    Worker->>Worker: Scrape Prospect DOM & Detect Tech Signals (scraper.py)
+    Worker->>Gemini: Synthesize Value Triangle Dossier (analyzer.py)
+    Gemini-->>Worker: Validated DiscoveryDossier Object
+    Worker->>GDocs: Create Styled Briefing Doc (exporter.py)
+    GDocs-->>Worker: Google Doc URL
+    Worker->>CRM: Attach Google Doc Link & Populate Custom Fields
+    Worker->>Slack: Notify #deal-room: "Pre-Discovery Brief ready for [Account Name]"
+```
+
+### Key Benefits of CRM Webhook Integration:
+1. **Zero Manual Overhead**: Account research runs automatically the moment a BDR qualifies a lead or books an introductory discovery call.
+2. **Standardized Deal Preparation**: Every Solution Engineer and Account Executive receives an identical, high-quality briefing doc attached directly to the Salesforce/HubSpot Opportunity record.
+3. **Real-time Deal Alerts**: Team notifications with direct links to the Google Doc brief in the deal Slack channel before the initial customer meeting.
+
+---
+
 ## Core Modules
 
 ### 1. `models.py` — Pydantic V2 Account Intelligence Contracts
@@ -86,43 +123,6 @@ Interactive web UI providing:
 - **Live Pipeline Feedback**: `st.status` widget updating step-by-step through DOM scraping, tech detection, Gemini 2.5 Flash synthesis, and Google Docs export.
 - **Direct Link Button**: One-click action button opening the created Google Doc directly (`Open Formatted Google Doc Brief ↗`).
 - **6-Tab Dossier Viewer**: Executive Overview, Tech Stack, Value Triangle Pain Points, Persona Questions, Recommended Strategy, and Raw Scraped Signals.
-
----
-
-## Enterprise Production Architecture: CRM Webhook Trigger
-
-> [!TIP]
-> **Production Recommendation: Event-Driven CRM Automation**
-> 
-> While the Streamlit interface provides an interactive workbench for ad-hoc research, in a **true enterprise deployment** this pipeline would run as an automated, event-driven service triggered by your CRM:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Rep as Sales Rep / BDR
-    participant CRM as Salesforce / HubSpot
-    participant Gateway as Webhook / API Gateway
-    participant Worker as Discovery Pipeline Worker
-    participant Gemini as Gemini 2.5 Flash
-    participant GDocs as Google Docs API
-    participant Slack as Slack / Teams Channel
-
-    Rep->>CRM: Moves Opportunity to "Stage 1 - Discovery Scheduled"
-    CRM->>Gateway: POST /api/v1/trigger-discovery (Account URL, BDR Notes, Revenue, Stage)
-    Gateway->>Worker: Dispatch Async Job (Cloud Run / Celery / Lambda)
-    Worker->>Worker: Scrape Prospect DOM & Detect Tech Signals (scraper.py)
-    Worker->>Gemini: Synthesize Value Triangle Dossier (analyzer.py)
-    Gemini-->>Worker: Validated DiscoveryDossier Object
-    Worker->>GDocs: Create Styled Briefing Doc (exporter.py)
-    GDocs-->>Worker: Google Doc URL
-    Worker->>CRM: Attach Google Doc Link & Populate Custom Fields
-    Worker->>Slack: Notify #deal-room: "Pre-Discovery Brief ready for [Account Name]"
-```
-
-### Key Benefits of CRM Webhook Integration:
-1. **Zero Manual Overhead**: Account research runs automatically the moment a BDR qualifies a lead or books an introductory discovery call.
-2. **Standardized Deal Preparation**: Every Solution Engineer and Account Executive receives an identical, high-quality briefing doc attached directly to the Salesforce/HubSpot Opportunity record.
-3. **Real-time Deal Alerts**: Team notifications with direct links to the Google Doc brief in the deal Slack channel before the initial customer meeting.
 
 ---
 
