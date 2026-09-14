@@ -348,7 +348,7 @@ def export_dossier_to_google_doc(
     # 1. Build document text and style requests
     builder = GoogleDocsBriefBuilder()
 
-    builder.add_line(f"Executive Pre-Discovery Briefing: {dossier.account_name}", style="TITLE")
+    builder.add_line(f"Executive Discovery Brief for {dossier.account_name}", style="TITLE")
     builder.add_line(f"Retail ERP & Omnichannel Modernization Dossier | Generated {dossier.generated_at[:10]}", style="SUBTITLE")
     builder.add_line("—" * 50)
     builder.add_line()
@@ -406,8 +406,8 @@ def export_dossier_to_google_doc(
 
     full_text = builder.get_full_text()
 
-    # 2. Create blank Google Doc
-    doc_title = f"Pre-Discovery Executive Brief - {dossier.account_name}"
+    # 2. Create the document via Docs API
+    doc_title = f"Executive Discovery Brief for {dossier.account_name}"
     created_doc = docs_service.documents().create(body={"title": doc_title}).execute()
     document_id = created_doc.get("documentId")
     logger.info(f"Created Google Doc ID: {document_id}")
@@ -445,6 +445,8 @@ def export_dossier_to_google_doc(
         logger.info(f"Drive permissions note (standard domain restriction): {pe}")
 
     doc_url = f"https://docs.google.com/document/d/{document_id}/edit"
+    logger.info(f"Published Google Doc successfully: {doc_url}")
+
     return {
         "document_id": document_id,
         "document_url": doc_url,
@@ -456,7 +458,7 @@ def export_dossier_to_google_doc(
 def export_dossier_to_markdown(dossier: DiscoveryDossier) -> str:
     """Generates a styled Markdown executive briefing representation of the dossier."""
     lines = [
-        f"# Executive Pre-Discovery Briefing: {dossier.account_name}",
+        f"# Executive Discovery Brief for {dossier.account_name}",
         f"**Target Account:** {dossier.account_name} | **Domain:** {dossier.domain} | **Generated:** {dossier.generated_at[:10]}",
         f"**Retail Segment:** {dossier.retail_segment} | **Scale:** {dossier.estimated_scale}",
         "",

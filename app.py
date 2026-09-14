@@ -152,12 +152,14 @@ with st.sidebar:
     if google_creds_option == "Upload Service Account JSON":
         uploaded_sa = st.file_uploader("Service Account JSON", type=["json"], help="Upload GCP Service Account JSON key.")
         if uploaded_sa:
+            uploaded_sa.seek(0)
             raw_content = uploaded_sa.read().decode("utf-8")
             with st.spinner("Validating Service Account credentials..."):
                 val = validate_service_account(raw_content)
 
             if val["valid"]:
                 service_account_json_content = raw_content
+                st.session_state["service_account_json_content"] = raw_content
                 if val.get("handshake_successful"):
                     st.success(
                         f"✅ **Authenticated & Verified**\n\n"
@@ -174,7 +176,12 @@ with st.sidebar:
                         st.caption(f"Note: {val['warning']}")
             else:
                 service_account_json_content = None
+                if "service_account_json_content" in st.session_state:
+                    del st.session_state["service_account_json_content"]
                 st.error(f"❌ **Invalid Service Account:**\n\n{val['error']}")
+        else:
+            if "service_account_json_content" in st.session_state:
+                del st.session_state["service_account_json_content"]
     elif google_creds_option == "Application Default (ADC) / Environment":
         adc = get_google_credentials()
         if adc:
@@ -354,32 +361,65 @@ if "latest_dossier" in st.session_state:
     raw_scrape = st.session_state.get("raw_scrape")
 
     st.markdown("---")
-    st.header(f"Executive Discovery Brief: {dossier.account_name}")
+    st.header(f"Executive Discovery Brief for {dossier.account_name}")
 
     # Top CTA Bar
     cta_col1, cta_col2 = st.columns([3, 1])
+    retry_upload_clicked = False
+
     with cta_col1:
         if google_doc_url:
             st.success("📄 **Live Google Doc Generated Successfully!**")
-            st.link_button(
-                label="🚀 Open Formatted Google Doc Brief ↗",
-                url=google_doc_url,
-                type="primary",
-            )
+            btn_col1, btn_col2 = st.columns([2, 1])
+            with btn_col1:
+                st.link_button(
+                    label="🚀 Open Formatted Google Doc Brief ↗",
+                    url=google_doc_url,
+                    type="primary",
+                    use_container_width=True,
+                )
+            with btn_col2:
+                retry_upload_clicked = st.button(
+                    "🔄 Retry Google Docs Upload",
+                    use_container_width=True,
+                    help="Re-upload or update the Google Doc brief.",
+                )
         else:
-            st.info("ℹ️ Google Doc export omitted or awaiting service account. Download the executive Markdown brief below.")
+            st.info("ℹ️ Google Doc export omitted or awaiting service account. Download the executive Markdown brief below, or retry uploading to Google Docs.")
             if doc_export_error:
                 st.caption(f"Google Docs API note: {doc_export_error}")
+            retry_upload_clicked = st.button(
+                "🔄 Retry Google Docs Upload",
+                type="primary",
+                use_container_width=False,
+                help="Attempt to export the brief to Google Docs with current credentials.",
+            )
 
     with cta_col2:
         safe_name = dossier.account_name.replace(" ", "_")
         st.download_button(
             label="⬇️ Download Markdown Brief",
             data=markdown_brief,
-            file_name=f"{safe_name}_Pre_Discovery_Brief.md",
+            file_name=f"{safe_name}_Executive_Discovery_Brief.md",
             mime="text/markdown",
             use_container_width=True,
         )
+
+    # Handle Retry Google Docs Upload action
+    if retry_upload_clicked:
+        with st.spinner(f"Exporting Executive Discovery Brief for {dossier.account_name} to Google Docs..."):
+            try:
+                creds_payload = service_account_json_content or st.session_state.get("service_account_json_content")
+                doc_res = export_dossier_to_google_doc(
+                    dossier=dossier,
+                    credentials_json=creds_payload,
+                )
+                st.session_state["google_doc_url"] = doc_res.get("document_url")
+                st.session_state["doc_export_error"] = None
+                st.rerun()
+            except Exception as retry_err:
+                st.session_state["doc_export_error"] = str(retry_err)
+                st.error(f"❌ Google Docs upload failed: {retry_err}")
 
     # Tabbed Dossier View
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
