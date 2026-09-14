@@ -23,7 +23,12 @@ import streamlit as st
 from models import DiscoveryDossier
 from scraper import scrape_retail_site
 from analyzer import analyze_retail_prospect
-from exporter import export_dossier_to_google_doc, export_dossier_to_markdown
+from exporter import (
+    export_dossier_to_google_doc,
+    export_dossier_to_markdown,
+    validate_service_account,
+    get_google_credentials,
+)
 
 # -----------------------------------------------------------------------------
 # PAGE CONFIGURATION & STYLING
@@ -145,10 +150,37 @@ with st.sidebar:
 
     service_account_json_content = None
     if google_creds_option == "Upload Service Account JSON":
-        uploaded_sa = st.file_uploader("Service Account JSON", type=["json"])
+        uploaded_sa = st.file_uploader("Service Account JSON", type=["json"], help="Upload GCP Service Account JSON key.")
         if uploaded_sa:
-            service_account_json_content = uploaded_sa.read().decode("utf-8")
-            st.caption("✅ Service Account file loaded")
+            raw_content = uploaded_sa.read().decode("utf-8")
+            with st.spinner("Validating Service Account credentials..."):
+                val = validate_service_account(raw_content)
+
+            if val["valid"]:
+                service_account_json_content = raw_content
+                if val.get("handshake_successful"):
+                    st.success(
+                        f"✅ **Authenticated & Verified**\n\n"
+                        f"• **Account:** `{val['client_email']}`\n\n"
+                        f"• **Project:** `{val['project_id']}`"
+                    )
+                else:
+                    st.info(
+                        f"ℹ️ **Credentials Structure Valid**\n\n"
+                        f"• **Account:** `{val['client_email']}`\n\n"
+                        f"• **Project:** `{val['project_id']}`"
+                    )
+                    if val.get("warning"):
+                        st.caption(f"Note: {val['warning']}")
+            else:
+                service_account_json_content = None
+                st.error(f"❌ **Invalid Service Account:**\n\n{val['error']}")
+    elif google_creds_option == "Application Default (ADC) / Environment":
+        adc = get_google_credentials()
+        if adc:
+            st.caption("✅ Google Cloud credentials detected in environment.")
+        else:
+            st.caption("ℹ️ No default GCP credentials detected. Upload a Service Account JSON above or use local Markdown export.")
 
     st.markdown("---")
     st.subheader("3. Scraper Settings")

@@ -180,6 +180,117 @@ class GoogleDocsBriefBuilder:
         return requests
 
 
+def validate_service_account(credentials_json: str) -> Dict[str, Any]:
+    """
+    Validates a Google Service Account JSON payload immediately upon upload.
+    Checks JSON syntax, required fields, parses credentials, and verifies the private key.
+    Attempts a live token refresh handshake with Google Auth endpoints.
+    """
+    if not credentials_json or not credentials_json.strip():
+        return {
+            "valid": False,
+            "error": "Uploaded file is empty.",
+            "client_email": "",
+            "project_id": "",
+            "handshake_successful": False,
+        }
+
+    try:
+        info = json.loads(credentials_json)
+    except json.JSONDecodeError as e:
+        return {
+            "valid": False,
+            "error": f"Invalid JSON format: {str(e)}",
+            "client_email": "",
+            "project_id": "",
+            "handshake_successful": False,
+        }
+
+    if not isinstance(info, dict):
+        return {
+            "valid": False,
+            "error": "JSON payload must be an object/dictionary, not a list or scalar.",
+            "client_email": "",
+            "project_id": "",
+            "handshake_successful": False,
+        }
+
+    doc_type = info.get("type")
+    if doc_type != "service_account":
+        return {
+            "valid": False,
+            "error": (
+                f"Invalid credential type '{doc_type}'. Expected a Google Cloud Service Account "
+                "JSON key with 'type': 'service_account'."
+            ),
+            "client_email": info.get("client_email", ""),
+            "project_id": info.get("project_id", ""),
+            "handshake_successful": False,
+        }
+
+    required_fields = ["project_id", "private_key", "client_email", "token_uri"]
+    missing = [f for f in required_fields if f not in info or not info[f]]
+    if missing:
+        return {
+            "valid": False,
+            "error": f"Missing required service account fields: {', '.join(missing)}",
+            "client_email": info.get("client_email", ""),
+            "project_id": info.get("project_id", ""),
+            "handshake_successful": False,
+        }
+
+    client_email = info.get("client_email", "")
+    project_id = info.get("project_id", "")
+
+    # Test key parsing
+    try:
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    except Exception as parse_err:
+        return {
+            "valid": False,
+            "error": f"Corrupted or invalid private key: {str(parse_err)}",
+            "client_email": client_email,
+            "project_id": project_id,
+            "handshake_successful": False,
+        }
+
+    # Attempt live authentication token handshake
+    try:
+        import google.auth.transport.requests
+        req = google.auth.transport.requests.Request()
+        creds.refresh(req)
+        return {
+            "valid": True,
+            "client_email": client_email,
+            "project_id": project_id,
+            "error": None,
+            "handshake_successful": True,
+            "message": f"Successfully authenticated as {client_email} (Project: {project_id})",
+        }
+    except Exception as handshake_err:
+        err_msg = str(handshake_err)
+        err_lower = err_msg.lower()
+        if any(keyword in err_lower for keyword in ["invalid_grant", "unauthorized", "deleted", "revoked"]):
+            return {
+                "valid": False,
+                "error": f"Google authentication failed: {err_msg}",
+                "client_email": client_email,
+                "project_id": project_id,
+                "handshake_successful": False,
+            }
+        else:
+            # Structure and key are valid, but network/proxy had a transient handshake note
+            return {
+                "valid": True,
+                "client_email": client_email,
+                "project_id": project_id,
+                "error": None,
+                "handshake_successful": False,
+                "warning": f"Credentials structure valid. Live handshake note: {err_msg}",
+                "message": f"Service account {client_email} (Project: {project_id})",
+            }
+
+
 def get_google_credentials(
     credentials_json: Optional[str] = None,
     service_account_path: Optional[str] = None,
