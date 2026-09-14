@@ -160,6 +160,8 @@ with st.sidebar:
             if val["valid"]:
                 service_account_json_content = raw_content
                 st.session_state["service_account_json_content"] = raw_content
+                st.session_state["service_account_project_id"] = val.get("project_id", "")
+                st.session_state["service_account_client_email"] = val.get("client_email", "")
                 if val.get("handshake_successful"):
                     st.success(
                         f"✅ **Authenticated & Verified**\n\n"
@@ -188,6 +190,26 @@ with st.sidebar:
             st.caption("✅ Google Cloud credentials detected in environment.")
         else:
             st.caption("ℹ️ No default GCP credentials detected. Upload a Service Account JSON above or use local Markdown export.")
+
+    folder_id_input = ""
+    share_email_input = ""
+    if google_creds_option != "Skip Google Docs (Local Markdown Only)":
+        with st.expander("📁 Drive Destination & Sharing (Optional)", expanded=False):
+            folder_id_input = st.text_input(
+                "Target Google Drive Folder ID",
+                value=st.session_state.get("target_folder_id", ""),
+                help="Paste the Folder ID from your Google Drive URL to place the created document inside a shared folder.",
+                placeholder="1a2b3c4d5e...",
+            )
+            st.session_state["target_folder_id"] = folder_id_input
+
+            share_email_input = st.text_input(
+                "Share Directly with Email",
+                value=st.session_state.get("share_recipient_email", ""),
+                help="Enter your Google Workspace or Gmail address to grant edit access to the generated brief.",
+                placeholder="you@company.com",
+            )
+            st.session_state["share_recipient_email"] = share_email_input
 
     st.markdown("---")
     st.subheader("3. Scraper Settings")
@@ -329,6 +351,8 @@ if submitted:
                 doc_res = export_dossier_to_google_doc(
                     dossier=dossier,
                     credentials_json=service_account_json_content,
+                    folder_id=folder_id_input.strip() if folder_id_input else None,
+                    share_with_email=share_email_input.strip() if share_email_input else None,
                 )
                 google_doc_url = doc_res.get("document_url")
                 status_container.write(f"✅ Google Doc created: {google_doc_url}")
@@ -387,7 +411,23 @@ if "latest_dossier" in st.session_state:
         else:
             st.info("ℹ️ Google Doc export omitted or awaiting service account. Download the executive Markdown brief below, or retry uploading to Google Docs.")
             if doc_export_error:
-                st.caption(f"Google Docs API note: {doc_export_error}")
+                if "403" in doc_export_error or "caller does not have permission" in doc_export_error.lower():
+                    proj = st.session_state.get("service_account_project_id", "")
+                    sa_acc = st.session_state.get("service_account_client_email", "")
+                    proj_param = f"?project={proj}" if proj else ""
+                    st.error(
+                        "🔒 **Google Cloud Permission Error (403: The caller does not have permission)**\n\n"
+                        "This occurs because the **Google Docs API** or **Google Drive API** is not enabled in your Google Cloud Project.\n\n"
+                        "**Quick Resolution Steps:**\n"
+                        f"1. 🔗 [**Enable Google Docs API**](https://console.cloud.google.com/apis/library/docs.googleapis.com{proj_param}) *(Click Enable)*\n"
+                        f"2. 🔗 [**Enable Google Drive API**](https://console.cloud.google.com/apis/library/drive.googleapis.com{proj_param}) *(Click Enable)*\n"
+                        "3. Once enabled, click **'🔄 Retry Google Docs Upload'** below!\n\n"
+                        f"*(Optional)*: If your Google Workspace restricts service accounts from creating files directly, "
+                        f"create a folder in Google Drive, share it with `{sa_acc or 'your service account'}` as Editor, and enter the **Folder ID** in the sidebar."
+                    )
+                else:
+                    st.error(f"⚠️ **Google Docs API Note:** {doc_export_error}")
+
             retry_upload_clicked = st.button(
                 "🔄 Retry Google Docs Upload",
                 type="primary",
@@ -410,16 +450,20 @@ if "latest_dossier" in st.session_state:
         with st.spinner(f"Exporting Executive Discovery Brief for {dossier.account_name} to Google Docs..."):
             try:
                 creds_payload = service_account_json_content or st.session_state.get("service_account_json_content")
+                t_folder = folder_id_input.strip() if folder_id_input else st.session_state.get("target_folder_id", "").strip()
+                s_email = share_email_input.strip() if share_email_input else st.session_state.get("share_recipient_email", "").strip()
                 doc_res = export_dossier_to_google_doc(
                     dossier=dossier,
                     credentials_json=creds_payload,
+                    folder_id=t_folder or None,
+                    share_with_email=s_email or None,
                 )
                 st.session_state["google_doc_url"] = doc_res.get("document_url")
                 st.session_state["doc_export_error"] = None
                 st.rerun()
             except Exception as retry_err:
                 st.session_state["doc_export_error"] = str(retry_err)
-                st.error(f"❌ Google Docs upload failed: {retry_err}")
+                st.rerun()
 
     # Tabbed Dossier View
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([

@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.auth import default as google_auth_default
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
@@ -326,9 +327,12 @@ def export_dossier_to_google_doc(
     dossier: DiscoveryDossier,
     credentials_json: Optional[str] = None,
     service_account_path: Optional[str] = None,
+    folder_id: Optional[str] = None,
+    share_with_email: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Creates and styles an executive pre-discovery briefing in Google Docs.
+    Supports optional Google Drive folder targeting and direct user email sharing.
     Returns a dictionary with document_id and view/edit URL.
     """
     creds = get_google_credentials(
@@ -341,6 +345,17 @@ def export_dossier_to_google_doc(
             "Google Docs API credentials not found. Please provide a Service Account JSON "
             "file path, credentials string, or configure Google Application Default Credentials (ADC)."
         )
+
+    # Extract metadata for actionable diagnostic hints
+    project_id = ""
+    client_email = ""
+    if credentials_json:
+        try:
+            c_info = json.loads(credentials_json)
+            project_id = c_info.get("project_id", "")
+            client_email = c_info.get("client_email", "")
+        except Exception:
+            pass
 
     docs_service = build("docs", "v1", credentials=creds)
     drive_service = build("drive", "v3", credentials=creds)
@@ -406,11 +421,38 @@ def export_dossier_to_google_doc(
 
     full_text = builder.get_full_text()
 
-    # 2. Create the document via Docs API
+    # 2. Create the document via Docs API or inside specified Drive folder
     doc_title = f"Executive Discovery Brief for {dossier.account_name}"
-    created_doc = docs_service.documents().create(body={"title": doc_title}).execute()
-    document_id = created_doc.get("documentId")
-    logger.info(f"Created Google Doc ID: {document_id}")
+    try:
+        if folder_id and folder_id.strip():
+            clean_folder = folder_id.strip()
+            logger.info(f"Creating Google Doc inside specified Drive folder: {clean_folder}")
+            file_metadata = {
+                "name": doc_title,
+                "mimeType": "application/vnd.google-apps.document",
+                "parents": [clean_folder],
+            }
+            created_file = drive_service.files().create(body=file_metadata, fields="id").execute()
+            document_id = created_file.get("id")
+        else:
+            created_doc = docs_service.documents().create(body={"title": doc_title}).execute()
+            document_id = created_doc.get("documentId")
+        logger.info(f"Created Google Doc ID: {document_id}")
+    except HttpError as he:
+        if he.resp.status == 403:
+            p_str = f" for project '{project_id}'" if project_id else ""
+            p_param = f"?project={project_id}" if project_id else ""
+            sa_str = f"`{client_email}`" if client_email else "your service account"
+            raise PermissionError(
+                f"Google Cloud Permission Error (HTTP 403: 'The caller does not have permission').\n\n"
+                f"The Google Docs API or Google Drive API is not enabled in your Google Cloud Project{p_str}.\n\n"
+                f"Required Fix (1-2 minutes):\n"
+                f"1. Enable Google Docs API: https://console.cloud.google.com/apis/library/docs.googleapis.com{p_param}\n"
+                f"2. Enable Google Drive API: https://console.cloud.google.com/apis/library/drive.googleapis.com{p_param}\n"
+                f"3. (Optional): If your organization restricts personal Drive file creation, create a folder in Google Drive, "
+                f"share it with {sa_str} as Editor, and provide the Folder ID in the sidebar."
+            ) from he
+        raise
 
     # 3. Populate text
     insert_request = [{
@@ -435,7 +477,18 @@ def export_dossier_to_google_doc(
         except Exception as se:
             logger.warning(f"Applied partial styles due to Google Docs API note: {se}")
 
-    # 5. Make accessible via link if possible
+    # 5. Share with specified user email or open link
+    if share_with_email and share_with_email.strip():
+        try:
+            clean_email = share_with_email.strip()
+            drive_service.permissions().create(
+                fileId=document_id,
+                body={"role": "writer", "type": "user", "emailAddress": clean_email},
+            ).execute()
+            logger.info(f"Directly shared Google Doc with {clean_email}")
+        except Exception as share_err:
+            logger.warning(f"Direct user share note for {share_with_email}: {share_err}")
+
     try:
         drive_service.permissions().create(
             fileId=document_id,
@@ -453,6 +506,7 @@ def export_dossier_to_google_doc(
         "title": doc_title,
         "success": True,
     }
+
 
 
 def export_dossier_to_markdown(dossier: DiscoveryDossier) -> str:
