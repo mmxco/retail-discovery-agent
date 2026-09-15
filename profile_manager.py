@@ -17,30 +17,31 @@ DEFAULT_PROFILES_FILE = os.path.join(
 )
 
 
-def load_saved_profiles(filepath: str = DEFAULT_PROFILES_FILE) -> Dict[str, Dict[str, Any]]:
+def load_saved_profiles(filepath: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
     """
     Loads saved target account profiles from the local JSON file.
     Returns a dictionary of {profile_key: profile_data_dict}.
     """
-    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+    target_filepath = filepath or DEFAULT_PROFILES_FILE
+    if not os.path.exists(target_filepath) or os.path.getsize(target_filepath) == 0:
         return {}
 
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(target_filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
-            logger.warning(f"Unexpected data format in {filepath}, expected dict, got {type(data)}")
+            logger.warning(f"Unexpected data format in {target_filepath}, expected dict, got {type(data)}")
             return {}
     except Exception as e:
-        logger.error(f"Error loading saved profiles from {filepath}: {e}")
+        logger.error(f"Error loading saved profiles from {target_filepath}: {e}")
         return {}
 
 
 def save_profile(
     profile_data: Dict[str, Any],
     profile_key: Optional[str] = None,
-    filepath: str = DEFAULT_PROFILES_FILE,
+    filepath: Optional[str] = None,
 ) -> str:
     """
     Saves or updates a target account profile in the local JSON storage.
@@ -49,7 +50,8 @@ def save_profile(
 
     Returns the assigned profile_key.
     """
-    profiles = load_saved_profiles(filepath)
+    target_filepath = filepath or DEFAULT_PROFILES_FILE
+    profiles = load_saved_profiles(target_filepath)
 
     dba = (profile_data.get("dba") or "").strip()
     domain = (profile_data.get("domain") or "").strip()
@@ -74,20 +76,21 @@ def save_profile(
 
     profiles[profile_key] = cleaned_profile
 
-    _write_profiles_atomically(profiles, filepath)
+    _write_profiles_atomically(profiles, target_filepath)
     logger.info(f"Successfully saved profile: {profile_key}")
     return profile_key
 
 
-def delete_profile(profile_key: str, filepath: str = DEFAULT_PROFILES_FILE) -> bool:
+def delete_profile(profile_key: str, filepath: Optional[str] = None) -> bool:
     """
     Deletes a target account profile from local JSON storage.
     Returns True if deleted, False if not found.
     """
-    profiles = load_saved_profiles(filepath)
+    target_filepath = filepath or DEFAULT_PROFILES_FILE
+    profiles = load_saved_profiles(target_filepath)
     if profile_key in profiles:
         del profiles[profile_key]
-        _write_profiles_atomically(profiles, filepath)
+        _write_profiles_atomically(profiles, target_filepath)
         logger.info(f"Successfully deleted profile: {profile_key}")
         return True
     return False

@@ -39,8 +39,12 @@ def test_successful_pain_point_extraction():
 
     with patch("discovery_pipeline.generate_structured_output", return_value=mock_brief):
         result = extract_pain_points(notes)
+
+        # 1. Structural Verification:
         assert isinstance(result, DiscoveryBrief)
         assert len(result.pain_points) > 0
+
+        # 2. Semantic Verification:
         for point in result.pain_points:
             assert point.category in ["Technical", "Business"]
 
@@ -65,5 +69,6 @@ def test_validation_error_handling():
     """
     mock_bad_json = '{"company_name": "Acme", "wrong_key": []}'
 
+    # Verify Pydantic traps the structural failure and raises ValidationError
     with pytest.raises(ValidationError):
         DiscoveryBrief.model_validate_json(mock_bad_json)
