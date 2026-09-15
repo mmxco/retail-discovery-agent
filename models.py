@@ -5,7 +5,8 @@ Value Triangle pain point analysis, and executive discovery questions.
 """
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from enum import Enum
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -114,6 +115,10 @@ class DiscoveryDossier(BaseModel):
         ...,
         description="Primary domain or website URL (e.g., https://target.com)."
     )
+    corporate_domain: Optional[str] = Field(
+        default=None,
+        description="Corporate website, parent company, or investor relations URL (e.g., https://corporate.target.com)."
+    )
     retail_segment: str = Field(
         ...,
         description="Retail segment (e.g., 'Apparel & Specialty', 'Department Store', 'Grocery & Convenience', 'Luxury & Beauty', 'Hardlines')."
@@ -145,4 +150,99 @@ class DiscoveryDossier(BaseModel):
     generated_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="ISO 8601 timestamp of dossier generation."
+    )
+
+
+# =====================================================================
+# Targeted Legacy ERP & Inventory Sync Pain Point Schemas
+# =====================================================================
+
+class LegacyDomainCategory(str, Enum):
+    """Target architectural domains constrained to specific legacy retail bottlenecks."""
+    EPICOR_ON_PREMISE = "EPICOR_ON_PREMISE"
+    AS400_ISERIES = "AS400_ISERIES"
+    MULTI_CHANNEL_INVENTORY_SYNC = "MULTI_CHANNEL_INVENTORY_SYNC"
+
+
+class TargetSystemDetection(BaseModel):
+    """Detected legacy system signature identified within the source text."""
+    model_config = ConfigDict(extra="ignore")
+
+    domain: LegacyDomainCategory = Field(
+        ...,
+        description="Target domain category (EPICOR_ON_PREMISE, AS400_ISERIES, or MULTI_CHANNEL_INVENTORY_SYNC)."
+    )
+    detected_system_name: str = Field(
+        ...,
+        description="Specific system identifier identified in text (e.g., 'Epicor 9', 'Epicor Vantage', 'IBM AS/400', 'iSeries RPG', 'Custom FTP Inventory Batch')."
+    )
+    confidence: Literal["HIGH", "MEDIUM", "LOW"] = Field(
+        ...,
+        description="Confidence score based on direct explicit mention ('HIGH') vs contextual inference ('MEDIUM'/'LOW')."
+    )
+    evidence_quote: str = Field(
+        ...,
+        description="Exact verbatim excerpt from the source text verifying the presence of this legacy footprint."
+    )
+
+
+class LegacyERPPainPointItem(BaseModel):
+    """
+    Granular, evidence-grounded pain point mapped directly to source text.
+    Strictly restricted to Epicor on-premise, AS400/iSeries, or inventory synchronization bottlenecks.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    target_domain: LegacyDomainCategory = Field(
+        ...,
+        description="The specific target domain of the identified bottleneck."
+    )
+    specific_system: str = Field(
+        ...,
+        description="The specific legacy software, hardware, or integration layer involved (e.g., 'Epicor Progress OpenEdge DB', 'AS400 RPG Batch Job', 'Nightly POS-to-Web Inventory Sync')."
+    )
+    verbatim_evidence: str = Field(
+        ...,
+        description="Direct, word-for-word quote from the source text confirming the technical or operational bottleneck. Must not be paraphrased or fabricated."
+    )
+    technical_bottleneck: str = Field(
+        ...,
+        description="Architectural root cause (e.g., monolithic batch processing, lack of REST/JSON endpoints, table locks during ODBC queries, 5250 terminal limitations, 4-hour batch sync latency)."
+    )
+    operational_friction: str = Field(
+        ...,
+        description="Day-to-day workflow consequence (e.g., store associates unable to see warehouse ATP, cancelled BOPIS orders, phantom inventory on digital storefront, manual CSV exports)."
+    )
+    financial_impact: str = Field(
+        ...,
+        description="Quantified monetary loss, margin erosion, or quantifiable business exposure (e.g., 18% order cancellation rate, $2M inventory buffer write-offs, 20 hours/week manual reconciliation)."
+    )
+    affected_stakeholders: List[str] = Field(
+        default_factory=list,
+        description="Executive and operational roles impacted (e.g., 'VP of Supply Chain', 'Chief Information Officer', 'Director of Store Operations', 'E-Commerce Merchandiser')."
+    )
+
+
+class LegacyERPPainPoints(BaseModel):
+    """
+    Parent extraction payload containing all identified legacy retail ERP constraints.
+    Enforces deterministic representation of both positive detections and negative/empty cases.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    has_legacy_systems: bool = Field(
+        ...,
+        description="Boolean flag indicating whether any targeted legacy systems (Epicor, AS400, or inventory sync bottlenecks) were detected."
+    )
+    detected_systems: List[TargetSystemDetection] = Field(
+        default_factory=list,
+        description="List of detected legacy systems with confidence ratings and verbatim textual evidence."
+    )
+    pain_points: List[LegacyERPPainPointItem] = Field(
+        default_factory=list,
+        description="Evidence-grounded legacy bottlenecks extracted strictly from the input payload. Empty if none detected."
+    )
+    extraction_summary: str = Field(
+        ...,
+        description="Factual, objective summary of the extraction findings. If no target legacy systems exist, must explicitly state: 'No targeted legacy ERP systems (Epicor, AS400) or multi-channel inventory sync bottlenecks detected.'"
     )

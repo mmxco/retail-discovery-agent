@@ -1190,6 +1190,8 @@ def export_dossier_to_google_doc(
     builder.add_line("1. Executive Overview & Account Context", style="HEADING_1")
     builder.add_labeled_line("Target Account", dossier.account_name)
     builder.add_labeled_line("Primary Domain", dossier.domain)
+    if dossier.corporate_domain:
+        builder.add_labeled_line("Corporate Website", dossier.corporate_domain)
     builder.add_labeled_line("Retail Segment", dossier.retail_segment)
     builder.add_labeled_line("Scale & Footprint", dossier.estimated_scale)
     builder.add_line()
@@ -1333,9 +1335,10 @@ def export_dossier_to_google_doc(
 
 def export_dossier_to_markdown(dossier: DiscoveryDossier) -> str:
     """Generates a styled Markdown executive briefing representation of the dossier."""
+    corp_str = f" | **Corporate Website:** {dossier.corporate_domain}" if dossier.corporate_domain else ""
     lines = [
         f"# Executive Discovery Brief for {dossier.account_name}",
-        f"**Target Account:** {dossier.account_name} | **Domain:** {dossier.domain} | **Generated:** {dossier.generated_at[:10]}",
+        f"**Target Account:** {dossier.account_name} | **Retail Domain:** {dossier.domain}{corp_str} | **Generated:** {dossier.generated_at[:10]}",
         f"**Retail Segment:** {dossier.retail_segment} | **Scale:** {dossier.estimated_scale}",
         "",
         "---",

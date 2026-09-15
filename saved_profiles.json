@@ -1,0 +1,11 @@
+{
+  "[Saved] Walmart": {
+    "domain": "https://walmart.com",
+    "corporate_url": "https://corporate.walmart.com",
+    "dba": "Walmart",
+    "careers_url": "https://corporate.walmart.com/careers",
+    "revenue": "713,200,000,000",
+    "headcount": "21,000,000",
+    "bdr_notes": "Walmart relies on an Everyday Low Price (EDLP) strategy but utilizes rollback promotions to maintain volume. Their massive scale makes them highly susceptible to margin erosion when promotional dynamics shift the basket mix.The Scenario: During periods of inflation, Walmart often sees top-line revenue grow while profit margins shrink. This occurs because foot traffic remains high, but shoppers shift their spending toward lower-margin grocery essentials and promotional items, leaving high-margin general merchandise on the shelves.  Metrics & Economic Impact: The promotion successfully drives the customer to the store (or site), but the failure to attach full-price, high-margin categories cannibalizes the overall profitability of the enterprise. In a low-margin retail environment, sacrificing margin percent for volume only works if the basket mix remains balanced.  Discovery Pivot (Implicating the Pain): Focus on the delayed visibility into basket profitability. Identify the Champion whose success is measured by gross margin dollars, and ask what technical levers they currently lack to halt or adjust an unprofitable promotion mid-cycle before the quarter closes"
+  }
+}

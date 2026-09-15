@@ -21,6 +21,7 @@ except Exception:
 import streamlit as st
 
 from models import DiscoveryDossier
+from profile_manager import load_saved_profiles, save_profile, delete_profile
 from scraper import scrape_retail_site, check_playwright_availability, restart_playwright
 from analyzer import analyze_retail_prospect
 from exporter import (
@@ -102,11 +103,12 @@ st.markdown("""
 # -----------------------------------------------------------------------------
 SCENARIOS = {
     "New Prospect / Blank Canvas": {
-        "domain": "", "dba": "", "revenue": "", 
+        "domain": "", "corporate_url": "", "dba": "", "revenue": "", 
         "headcount": "", "careers_url": "", "bdr_notes": ""
     },
     "Scenario 1: Target - Regional Assortment & Allocation Misalignment": {
         "domain": "https://target.com",
+        "corporate_url": "https://corporate.target.com",
         "dba": "Target",
         "revenue": "$104,780,000,000",
         "headcount": "440,000",
@@ -115,6 +117,7 @@ SCENARIOS = {
     },
     "Scenario 2: Nordstrom - Omnichannel Fulfillment & Stock Accuracy": {
         "domain": "https://www.nordstrom.com",
+        "corporate_url": "https://press.nordstrom.com",
         "dba": "Nordstrom",
         "revenue": "$14,800,000,000",
         "headcount": "60,000",
@@ -123,6 +126,7 @@ SCENARIOS = {
     },
     "Scenario 3: Williams-Sonoma - High-AOV Specialty Logistics": {
         "domain": "https://www.williams-sonoma.com",
+        "corporate_url": "https://www.williams-sonomainc.com",
         "dba": "Williams-Sonoma",
         "revenue": "$8,670,000,000",
         "headcount": "28,000",
@@ -658,13 +662,65 @@ st.markdown(
 
 st.markdown("---")
 
-# Scenario Selector
-selected_scenario_name = st.selectbox(
-    "Load Preset Demo Scenario:",
-    options=list(SCENARIOS.keys()),
-    index=1,
-)
-scenario_data = SCENARIOS[selected_scenario_name]
+# -----------------------------------------------------------------------------
+# SCENARIO & SAVED PROFILE MANAGEMENT
+# -----------------------------------------------------------------------------
+saved_profiles = load_saved_profiles()
+all_scenarios = {**SCENARIOS, **saved_profiles}
+all_scenario_keys = list(all_scenarios.keys())
+
+# Manage selected profile index
+current_selection = st.session_state.get("selected_scenario_name")
+if current_selection in all_scenario_keys:
+    default_idx = all_scenario_keys.index(current_selection)
+elif "last_saved_key" in st.session_state and st.session_state["last_saved_key"] in all_scenario_keys:
+    default_idx = all_scenario_keys.index(st.session_state["last_saved_key"])
+    del st.session_state["last_saved_key"]
+else:
+    default_idx = 1 if len(all_scenario_keys) > 1 else 0
+
+col_sel, col_action = st.columns([5, 1])
+with col_sel:
+    selected_scenario_name = st.selectbox(
+        "Select Target Account Profile:",
+        options=all_scenario_keys,
+        index=default_idx,
+        help="Choose a pre-configured demo scenario, a persistent saved profile, or Blank Canvas to create a new prospect.",
+    )
+    st.session_state["selected_scenario_name"] = selected_scenario_name
+
+is_saved_profile = selected_scenario_name in saved_profiles
+
+with col_action:
+    st.write("")  # Visual vertical alignment with selectbox
+    st.write("")
+    if is_saved_profile:
+        if st.button("🗑️ Delete", help=f"Delete saved profile '{selected_scenario_name}'", type="secondary", width="stretch"):
+            delete_profile(selected_scenario_name)
+            st.session_state["selected_scenario_name"] = list(SCENARIOS.keys())[0]
+            st.session_state["target_form_domain"] = ""
+            st.session_state["target_form_corporate_url"] = ""
+            st.session_state["target_form_dba"] = ""
+            st.session_state["target_form_careers"] = ""
+            st.session_state["target_form_revenue"] = ""
+            st.session_state["target_form_headcount"] = ""
+            st.session_state["target_form_bdr_notes"] = ""
+            st.session_state["last_loaded_scenario"] = list(SCENARIOS.keys())[0]
+            st.toast(f"Deleted profile '{selected_scenario_name}'", icon="🗑️")
+            st.rerun()
+
+scenario_data = all_scenarios.get(selected_scenario_name, {})
+
+# Synchronize form fields when user switches profile
+if st.session_state.get("last_loaded_scenario") != selected_scenario_name:
+    st.session_state["target_form_domain"] = scenario_data.get("domain", "")
+    st.session_state["target_form_corporate_url"] = scenario_data.get("corporate_url", "")
+    st.session_state["target_form_dba"] = scenario_data.get("dba", "")
+    st.session_state["target_form_careers"] = scenario_data.get("careers_url", "")
+    st.session_state["target_form_revenue"] = scenario_data.get("revenue", "")
+    st.session_state["target_form_headcount"] = scenario_data.get("headcount", "")
+    st.session_state["target_form_bdr_notes"] = scenario_data.get("bdr_notes", "")
+    st.session_state["last_loaded_scenario"] = selected_scenario_name
 
 # Context Form
 with st.form("discovery_pipeline_form"):
@@ -673,40 +729,74 @@ with st.form("discovery_pipeline_form"):
 
     with col1:
         domain_input = st.text_input(
-            "Retailer Website / Domain *",
-            value=scenario_data.get("domain", ""),
-            placeholder="https://target.com"
+            "Retail / E-Commerce Website *",
+            key="target_form_domain",
+            placeholder="https://target.com",
+            help="Primary customer-facing digital storefront or e-commerce website."
+        )
+        corporate_url_input = st.text_input(
+            "Corporate Website (Optional)",
+            key="target_form_corporate_url",
+            placeholder="https://corporate.target.com",
+            help="Parent corporate entity, investor relations, or corporate leadership site."
         )
         dba_input = st.text_input(
             "Brand / Account Name *",
-            value=scenario_data.get("dba", ""),
+            key="target_form_dba",
             placeholder="Target"
         )
         careers_input = st.text_input(
-            "Careers or Corporate URL (Optional)",
-            value=scenario_data.get("careers_url", ""),
+            "Careers URL (Optional)",
+            key="target_form_careers",
             placeholder="https://corporate.target.com/careers"
         )
 
     with col2:
         revenue_input = st.text_input(
             "Estimated Annual Revenue",
-            value=scenario_data.get("revenue", ""),
+            key="target_form_revenue",
             placeholder="$1,000,000,000"
         )
         headcount_input = st.text_input(
             "Employee Headcount / Store Count",
-            value=scenario_data.get("headcount", ""),
+            key="target_form_headcount",
             placeholder="10,000 employees / 250 stores"
         )
         bdr_notes_input = st.text_area(
             "Initial CRM / BDR Call Notes (Optional)",
-            value=scenario_data.get("bdr_notes", ""),
+            key="target_form_bdr_notes",
             placeholder="Key notes from initial call with prospect merchandising or IT leads...",
             height=100
         )
 
-    submitted = st.form_submit_button("🚀 Run Pre-Sales Discovery Pipeline", type="primary", width='stretch')
+    btn_col1, btn_col2 = st.columns([3, 1])
+    with btn_col1:
+        submitted = st.form_submit_button("🚀 Run Pre-Sales Discovery Pipeline", type="primary", width='stretch')
+    with btn_col2:
+        save_only = st.form_submit_button("💾 Save Profile", type="secondary", width='stretch')
+
+# -----------------------------------------------------------------------------
+# SAVE PROFILE ONLY ACTION
+# -----------------------------------------------------------------------------
+if save_only:
+    if not (dba_input.strip() or domain_input.strip()):
+        st.warning("⚠️ Please provide at least a Brand / Account Name or Retail Website before saving.")
+    else:
+        profile_data = {
+            "domain": domain_input.strip(),
+            "corporate_url": corporate_url_input.strip(),
+            "dba": dba_input.strip(),
+            "careers_url": careers_input.strip(),
+            "revenue": revenue_input.strip(),
+            "headcount": headcount_input.strip(),
+            "bdr_notes": bdr_notes_input.strip(),
+        }
+        target_key = selected_scenario_name if is_saved_profile else None
+        saved_key = save_profile(profile_data, profile_key=target_key)
+        st.session_state["selected_scenario_name"] = saved_key
+        st.session_state["last_loaded_scenario"] = saved_key
+        st.toast(f"Profile '{saved_key}' saved to disk!", icon="💾")
+        st.rerun()
 
 # -----------------------------------------------------------------------------
 # PIPELINE ORCHESTRATION & EXECUTION
@@ -724,17 +814,59 @@ if submitted:
         st.error("A Gemini API Key is required. Please enter it in the sidebar.")
         st.stop()
 
+    # Automatically persist profile to storage
+    auto_profile_data = {
+        "domain": domain_input.strip(),
+        "corporate_url": corporate_url_input.strip(),
+        "dba": dba_input.strip(),
+        "careers_url": careers_input.strip(),
+        "revenue": revenue_input.strip(),
+        "headcount": headcount_input.strip(),
+        "bdr_notes": bdr_notes_input.strip(),
+    }
+    target_key = selected_scenario_name if is_saved_profile else None
+    auto_saved_key = save_profile(auto_profile_data, profile_key=target_key)
+    st.session_state["selected_scenario_name"] = auto_saved_key
+    st.session_state["last_loaded_scenario"] = auto_saved_key
+
     status_container = st.status("Executing Retail Pre-Sales Discovery Pipeline...", expanded=True)
 
     try:
         # Step 1: Deep Crawl storefront, About Us, Leadership & Press Releases
-        status_container.write(f"🌐 Executing multi-page retail crawl (Storefront, About Us, Leadership, Press) on {domain_input}...")
+        status_container.write(f"🌐 Executing multi-page retail crawl (Storefront) on {domain_input}...")
         scrape_result = scrape_retail_site(
             url=domain_input.strip(),
             prefer_playwright=True,
             timeout_ms=30000,
             deep_crawl=True,
         )
+
+        # Corporate Crawl if separate corporate URL provided
+        if corporate_url_input.strip() and corporate_url_input.strip().rstrip('/') != domain_input.strip().rstrip('/'):
+            status_container.write(f"🏢 Scraping corporate portal & executive intelligence from {corporate_url_input}...")
+            try:
+                corp_res = scrape_retail_site(
+                    url=corporate_url_input.strip(),
+                    prefer_playwright=True,
+                    timeout_ms=25000,
+                    deep_crawl=True,
+                )
+                if corp_res.success:
+                    if corp_res.about_us_content.get("markdown_text"):
+                        cur_about = scrape_result.about_us_content.get("markdown_text", "")
+                        if not cur_about or len(corp_res.about_us_content.get("markdown_text", "")) > len(cur_about):
+                            scrape_result.about_us_content = corp_res.about_us_content
+                    if corp_res.leadership_content.get("markdown_text"):
+                        cur_lead = scrape_result.leadership_content.get("markdown_text", "")
+                        if not cur_lead or len(corp_res.leadership_content.get("markdown_text", "")) > len(cur_lead):
+                            scrape_result.leadership_content = corp_res.leadership_content
+                    if corp_res.press_releases:
+                        scrape_result.press_releases = (corp_res.press_releases + scrape_result.press_releases)[:8]
+                    if corp_res.tech_signals:
+                        combined_signals = set(scrape_result.tech_signals + corp_res.tech_signals)
+                        scrape_result.tech_signals = sorted(list(combined_signals))
+            except Exception as corp_err:
+                status_container.write(f"⚠️ Corporate crawl note: {corp_err}. Continuing with storefront intelligence...")
 
         careers_content = ""
         if careers_input.strip():
@@ -771,6 +903,7 @@ if submitted:
             about_us_content=scrape_result.about_us_content,
             leadership_content=scrape_result.leadership_content,
             press_releases=scrape_result.press_releases,
+            corporate_url=corporate_url_input.strip(),
             api_key=api_key_input.strip(),
             model_name=model_choice,
             disable_ssl_verify=disable_ssl,
@@ -955,13 +1088,24 @@ if "latest_dossier" in st.session_state:
     # Tab 1: Executive Overview
     with tab1:
         st.subheader("Account Positioning & Scope")
-        ov_col1, ov_col2, ov_col3 = st.columns(3)
-        with ov_col1:
-            st.metric("Retail Segment", dossier.retail_segment)
-        with ov_col2:
-            st.metric("Estimated Scale", dossier.estimated_scale)
-        with ov_col3:
-            st.metric("Domain", dossier.domain)
+        if dossier.corporate_domain:
+            ov_col1, ov_col2, ov_col3, ov_col4 = st.columns(4)
+            with ov_col1:
+                st.metric("Retail Segment", dossier.retail_segment)
+            with ov_col2:
+                st.metric("Estimated Scale", dossier.estimated_scale)
+            with ov_col3:
+                st.metric("Retail Domain", dossier.domain)
+            with ov_col4:
+                st.metric("Corporate Site", dossier.corporate_domain)
+        else:
+            ov_col1, ov_col2, ov_col3 = st.columns(3)
+            with ov_col1:
+                st.metric("Retail Segment", dossier.retail_segment)
+            with ov_col2:
+                st.metric("Estimated Scale", dossier.estimated_scale)
+            with ov_col3:
+                st.metric("Domain", dossier.domain)
 
         st.markdown("### Strategic Executive Summary")
         st.write(dossier.executive_summary)

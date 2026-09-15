@@ -90,6 +90,7 @@ def build_analysis_prompt(
     about_us_content: Optional[Dict[str, Any]] = None,
     leadership_content: Optional[Dict[str, Any]] = None,
     press_releases: Optional[List[Dict[str, str]]] = None,
+    corporate_url: Optional[str] = "",
 ) -> str:
     """Constructs the comprehensive prompt payload for Gemini 2.5 Flash."""
     # Truncate markdown to ~25,000 characters if exceptionally large to preserve token focus
@@ -100,6 +101,7 @@ def build_analysis_prompt(
         "target_account": {
             "account_name": account_name or "Retail Prospect",
             "domain": domain,
+            "corporate_website": corporate_url or "Not provided (same as retail domain)",
             "annual_revenue": annual_revenue or "Undisclosed / Publicly traded estimate",
             "headcount": headcount or "Undisclosed",
         },
@@ -146,6 +148,7 @@ def analyze_retail_prospect(
     about_us_content: Optional[Dict[str, Any]] = None,
     leadership_content: Optional[Dict[str, Any]] = None,
     press_releases: Optional[List[Dict[str, str]]] = None,
+    corporate_url: Optional[str] = "",
     api_key: Optional[str] = None,
     model_name: str = "gemini-2.5-flash",
     disable_ssl_verify: bool = False,
@@ -181,6 +184,7 @@ def analyze_retail_prospect(
         about_us_content=about_us_content,
         leadership_content=leadership_content,
         press_releases=press_releases,
+        corporate_url=corporate_url,
     )
 
     logger.info(f"Invoking {model_name} with structured output for {account_name or domain}...")
@@ -233,12 +237,18 @@ def analyze_retail_prospect(
             raise
 
     # Validate and deserialize response into DiscoveryDossier
+    dossier = None
     if hasattr(response, "parsed") and isinstance(response.parsed, DiscoveryDossier):
-        return response.parsed
+        dossier = response.parsed
     elif hasattr(response, "parsed") and isinstance(response.parsed, dict):
-        return DiscoveryDossier.model_validate(response.parsed)
+        dossier = DiscoveryDossier.model_validate(response.parsed)
     elif response.text:
-        return DiscoveryDossier.model_validate_json(response.text)
+        dossier = DiscoveryDossier.model_validate_json(response.text)
     else:
         raise RuntimeError("Gemini returned an empty response with no parsed object or text.")
+
+    if corporate_url and not dossier.corporate_domain:
+        dossier.corporate_domain = corporate_url
+
+    return dossier
 

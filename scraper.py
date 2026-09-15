@@ -89,10 +89,11 @@ EVASION_INIT_SCRIPT = """
 
 # Technology Footprint & Platform Signatures
 TECH_SIGNATURES: Dict[str, List[str]] = {
-    # E-Commerce Engines
+    # E-Commerce Engines & CMS
     "Shopify Plus": [r"cdn\.shopify\.com", r"Shopify\.", r"myshopify\.com", r"shopify-buy"],
     "Salesforce Commerce Cloud (Demandware)": [r"demandware\.net", r"demandware\.static", r"dw\.js", r"dwac_"],
-    "Adobe Commerce / Magento": [r"mage\/", r"magento", r"static\/_requirejs", r"mage-translation-dictionary"],
+    "Adobe Commerce / Magento": [r"(?<![a-zA-Z])mage\/", r"magento", r"static\/_requirejs", r"mage-translation-dictionary"],
+    "Adobe Experience Manager (AEM)": [r"/etc\.clientlibs/", r"/etc/designs/", r"cq:template", r"aem-Grid", r"cmp-container"],
     "SAP Commerce Cloud (Hybris)": [r"hybris", r"sap-commerce", r"occ\/v2", r"medias\/sys_master"],
     "Oracle Retail / NetSuite / ATG": [r"atg\.js", r"oracle\.com\/retail", r"netsuite\.com", r"elqCfg"],
     "BigCommerce": [r"cdn11\.bigcommerce\.com", r"bigcommerce\.com"],
@@ -123,11 +124,11 @@ TECH_SIGNATURES: Dict[str, List[str]] = {
 # Heuristic URL Pattern Matchers for Target Discovery
 LINK_PATTERNS = {
     "about": re.compile(
-        r"(about-us|about-company|about-our-company|about-the-company|our-story|who-we-are|company-overview|heritage|our-history|about-brand|our-heritage|about)",
+        r"(about-us|about-company|about-our-company|about-the-company|our-story|who-we-are|company-overview|heritage|our-history|about-brand|our-heritage|about|purpose)",
         re.I
     ),
     "press": re.compile(
-        r"(press|newsroom|news-releases|press-releases|investor|investors|media-center|corporate-news)",
+        r"(press|newsroom|news-releases|press-releases|investor|investors|media-center|corporate-news|(?<![a-zA-Z])news(?![a-zA-Z]))",
         re.I
     ),
     "leadership": re.compile(
@@ -147,7 +148,9 @@ NOISE_TAGS = [
 ]
 
 BOILERPLATE_CLASS_ID_REGEX = re.compile(
-    r"(cookie|consent|banner|popup|modal|overlay|onetrust|gdpr|newsletter|subscribe|toast|alertdialog)",
+    r"(cookie|consent|banner|popup|modal|overlay|onetrust|gdpr|newsletter|subscribe|toast|alertdialog|"
+    r"experiencefragment--header|experiencefragment--footer|walmart-hub-header|site-header|site-footer|"
+    r"global-header|global-footer|navbar|nav-wrapper|links-wrapper|hamburger|FooterWc|footer-container|header-container)",
     re.I
 )
 
@@ -237,40 +240,71 @@ def detect_tech_signals(soup: BeautifulSoup, raw_html: str = "") -> List[str]:
 
 def sanitize_dom(soup: BeautifulSoup, target_semantic_container: bool = True) -> Tag:
     """
-    Decomposes noise and boilerplate elements while preserving primary semantic content.
+    Decomposes noise, boilerplate, navigation, and modal elements while preserving primary semantic content.
     Returns the target semantic container or body tag.
     """
     # 1. Remove HTML comments
-    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
-        comment.extract()
+    for comment in list(soup.find_all(string=lambda text: isinstance(text, Comment))):
+        try:
+            comment.extract()
+        except Exception:
+            pass
 
     # 2. Decompose noise tags completely
-    for tag in soup.find_all(NOISE_TAGS):
-        tag.decompose()
+    for tag in list(soup.find_all(NOISE_TAGS)):
+        if getattr(tag, "decomposed", False):
+            continue
+        try:
+            tag.decompose()
+        except Exception:
+            pass
 
-    # 3. Decompose cookie/consent/modal banners
-    for element in soup.find_all(["div", "section", "aside", "span"]):
-        class_str = " ".join(element.get("class", [])) if isinstance(element.get("class"), list) else ""
-        elem_id = element.get("id", "")
-        role = element.get("role", "")
+    # 3. Decompose cookie/consent/modal banners and corporate header/footer wrappers
+    for element in list(soup.find_all(["div", "section", "aside", "span", "nav", "header", "footer"])):
+        if getattr(element, "decomposed", False) or getattr(element, "attrs", None) is None:
+            continue
+        class_val = element.attrs.get("class", [])
+        class_str = " ".join(class_val) if isinstance(class_val, list) else str(class_val)
+        elem_id = str(element.attrs.get("id", ""))
+        role = str(element.attrs.get("role", ""))
         if (
             BOILERPLATE_CLASS_ID_REGEX.search(class_str)
             or BOILERPLATE_CLASS_ID_REGEX.search(elem_id)
-            or role in ["banner", "alertdialog"]
+            or role in ["banner", "alertdialog", "navigation", "contentinfo"]
         ):
-            element.decompose()
+            try:
+                element.decompose()
+            except Exception:
+                pass
 
-    # 4. Target semantic content container if requested
+    # 4. Remove skip-to navigation links
+    for a in list(soup.find_all("a")):
+        if getattr(a, "decomposed", False) or getattr(a, "attrs", None) is None:
+            continue
+        href = str(a.attrs.get("href", ""))
+        txt = a.get_text(strip=True).lower()
+        if href.startswith(("#skip", "#main-content", "#content")) or "skip to" in txt:
+            try:
+                a.decompose()
+            except Exception:
+                pass
+
+    # 5. Target semantic content container if requested
     if target_semantic_container:
         candidates = [
             soup.find("main"),
             soup.find("article"),
-            soup.find(id=re.compile(r"^(content|main|news-content|article-body|press-body)$", re.I)),
-            soup.find(class_=re.compile(r"^(main-content|article-content|news-body|press-releases|page-content)$", re.I)),
+            soup.find(id=re.compile(r"^(content|main|news-content|article-body|press-body|leadership-content)$", re.I)),
+            soup.find(class_=re.compile(r"^(main-content|article-content|news-body|press-releases|page-content|content-container)$", re.I)),
             soup.find("div", attrs={"role": "main"}),
         ]
         for candidate in candidates:
-            if candidate and len(candidate.get_text(strip=True)) > 150:
+            if (
+                candidate
+                and getattr(candidate, "attrs", None) is not None
+                and not getattr(candidate, "decomposed", False)
+                and len(candidate.get_text(strip=True)) > 150
+            ):
                 return candidate
 
     return soup.body or soup
@@ -302,6 +336,13 @@ def clean_html_dom(html: str) -> Tuple[BeautifulSoup, Dict[str, str], List[str]]
     """
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.get_text(strip=True) if soup.title else ""
+    if not title:
+        og_title = (
+            soup.find("meta", attrs={"property": re.compile(r"^og:title$", re.I)})
+            or soup.find("meta", attrs={"name": re.compile(r"^twitter:title$", re.I)})
+        )
+        if og_title and og_title.get("content"):
+            title = og_title["content"].strip()
 
     meta_desc = ""
     meta_desc_tag = (
@@ -440,6 +481,14 @@ class ApparelDiscoveryCrawler:
         parsed_base = urlparse(base_url)
         base_domain = parsed_base.netloc.lower().replace("www.", "")
 
+        def get_root_domain(dom: str) -> str:
+            parts = dom.split(".")
+            if len(parts) >= 2:
+                return ".".join(parts[-2:])
+            return dom
+
+        base_root = get_root_domain(base_domain)
+
         discovered_candidates: Dict[str, List[Tuple[int, str]]] = {
             "about": [],
             "press": [],
@@ -456,9 +505,10 @@ class ApparelDiscoveryCrawler:
             resolved_url = urljoin(base_url, href)
             parsed_res = urlparse(resolved_url)
             resolved_domain = parsed_res.netloc.lower().replace("www.", "")
+            resolved_root = get_root_domain(resolved_domain)
 
-            # Exclude external domains except corporate/investor subdomains
-            if base_domain not in resolved_domain:
+            # Exclude external domains, but allow same root domain (e.g. corporate.walmart.com and investors.walmart.com)
+            if base_root != resolved_root and base_domain not in resolved_domain and resolved_domain not in base_domain:
                 continue
 
             # Exclude asset files
@@ -469,6 +519,7 @@ class ApparelDiscoveryCrawler:
             link_text = a.get_text(" ", strip=True)
             searchable_target = f"{resolved_url} {link_text}"
             norm_path = parsed_res.path.rstrip("/").lower()
+            norm_path_clean = re.sub(r"\.html?$", "", norm_path)
             norm_text = link_text.lower()
 
             for category, pattern in LINK_PATTERNS.items():
@@ -480,10 +531,10 @@ class ApparelDiscoveryCrawler:
                     # Score candidate priority (higher score = better primary match)
                     score = 10
                     if category == "about":
-                        # Ideal About Us root landing pages (like /browse/about, /about-us, /about, /our-story)
-                        if norm_path in ["/about", "/about-us", "/our-story", "/browse/about", "/who-we-are", "/about/our-story"]:
+                        # Ideal About Us root landing pages (like /browse/about, /about-us, /about, /our-story, /purpose)
+                        if norm_path_clean in ["/about", "/about-us", "/our-story", "/browse/about", "/who-we-are", "/about/our-story", "/purpose"]:
                             score += 100
-                        if norm_text in ["about us", "about", "our story", "who we are", "about nordstrom", "about our company"]:
+                        if norm_text in ["about us", "about", "our story", "who we are", "about nordstrom", "about our company", "about walmart"]:
                             score += 80
                         elif "about" in norm_text:
                             score += 40
@@ -495,16 +546,27 @@ class ApparelDiscoveryCrawler:
                             score -= 70
 
                     elif category == "leadership":
-                        if norm_path in ["/leadership", "/our-team", "/our-leadership", "/about-us/team", "/executives", "/board-of-directors"]:
+                        if norm_path_clean in ["/leadership", "/our-team", "/our-leadership", "/about-us/team", "/executives", "/board-of-directors", "/about/leadership", "/about/board-of-directors"]:
                             score += 100
-                        if norm_text in ["leadership", "our leaders", "executive team", "board of directors", "our team"]:
+                        elif norm_path_clean.endswith(("/leadership", "/executives", "/board-of-directors")):
+                            score += 80
+                        if norm_text in ["leadership", "our leaders", "executive team", "board of directors", "our team", "executives"]:
                             score += 80
 
                     elif category == "press":
-                        if norm_path in ["/press", "/press-releases", "/newsroom", "/news-releases", "/investors/press-releases"]:
+                        # Ideal Newsroom / Press root landing pages
+                        if norm_path_clean in ["/press", "/press-releases", "/newsroom", "/news-releases", "/investors/press-releases", "/news", "/corporate/news", "/media"]:
                             score += 100
-                        if norm_text in ["press releases", "newsroom", "press", "media center"]:
+                        elif norm_path_clean.endswith(("/newsroom", "/press-releases", "/news")):
                             score += 80
+                        if norm_text in ["press releases", "newsroom", "press", "media center", "news", "view newsroom"]:
+                            score += 80
+                        elif "newsroom" in norm_text or "press release" in norm_text:
+                            score += 40
+
+                        # Penalize deep dated individual articles so root newsroom is selected
+                        if re.search(r"/\d{4}/\d{2}/", norm_path):
+                            score -= 50
 
                     discovered_candidates[category].append((score, resolved_url))
 
@@ -565,35 +627,79 @@ class ApparelDiscoveryCrawler:
         soup = BeautifulSoup(html, "html.parser")
         press_items: List[PressReleaseItem] = []
 
-        # Look for article blocks or news list items
-        article_candidates = soup.find_all(
-            ["article", "li", "div"],
-            class_=re.compile(r"(press-release|news-item|article-card|media-item|news-release)", re.I)
-        )
+        # 1. First look for semantic <article> tags
+        article_candidates = soup.find_all("article")
 
-        if not article_candidates:
-            # Fallback to general article tags
-            article_candidates = soup.find_all("article")
+        # 2. If insufficient <article> tags, look for cards/items with news classes
+        if len(article_candidates) < 2:
+            class_candidates = soup.find_all(
+                ["article", "li", "div"],
+                class_=re.compile(r"(press-release|news-item|article-card|media-item|news-release|newsroom-card)", re.I)
+            )
+            if class_candidates:
+                article_candidates = class_candidates
 
-        for item in article_candidates[:5]:  # Capture top 5 items
-            # Title
-            title_tag = item.find(["h2", "h3", "h4", "a"])
-            title = title_tag.get_text(strip=True) if title_tag else "Corporate Announcement"
+        seen_urls: Set[str] = set()
+        seen_titles: Set[str] = set()
 
-            # Link
-            link_tag = item.find("a", href=True)
-            item_url = urljoin(page_url, link_tag["href"]) if link_tag else page_url
+        for item in article_candidates:
+            if getattr(item, "decomposed", False) or getattr(item, "attrs", None) is None:
+                continue
+
+            # Title: search headings first to avoid capturing empty thumbnail/icon anchors
+            title = ""
+            for heading_tag in item.find_all(["h1", "h2", "h3", "h4", "h5"]):
+                t = heading_tag.get_text(" ", strip=True)
+                if t and len(t) > 5 and "placeholder" not in t.lower():
+                    title = t
+                    break
+
+            if not title:
+                for a_tag in item.find_all("a", href=True):
+                    t = a_tag.get_text(" ", strip=True)
+                    if t and len(t) > 5 and "placeholder" not in t.lower():
+                        title = t
+                        break
+
+            if not title or "placeholder" in title.lower():
+                continue
+
+            # Link: resolve target URL, preferring anchor with text
+            item_url = page_url
+            for a_tag in item.find_all("a", href=True):
+                href = a_tag.get("href", "").strip()
+                if href and not href.startswith("#") and not href.endswith(".html#"):
+                    resolved = urljoin(page_url, href)
+                    if a_tag.get_text(strip=True):
+                        item_url = resolved
+                        break
+                    elif item_url == page_url:
+                        item_url = resolved
+
+            if item_url in seen_urls or title.lower() in seen_titles:
+                continue
 
             # Body snippet
-            container = sanitize_dom(BeautifulSoup(str(item), "html.parser"), target_semantic_container=False)
-            text_md = convert_dom_to_markdown(container)
+            clean_item_soup = BeautifulSoup(str(item), "html.parser")
+            for tag in list(clean_item_soup.find_all(["script", "style", "svg", "button", "input", "form"])):
+                if not getattr(tag, "decomposed", False):
+                    try:
+                        tag.decompose()
+                    except Exception:
+                        pass
+            text_md = convert_dom_to_markdown(clean_item_soup).strip()
 
-            if len(text_md) > 40:
+            if len(text_md) > 25:
+                seen_urls.add(item_url)
+                seen_titles.add(title.lower())
                 press_items.append(PressReleaseItem(
                     title=title,
                     source_url=item_url,
-                    markdown_text=text_md[:2000]  # Store concise summary
+                    markdown_text=text_md[:2000]
                 ))
+
+            if len(press_items) >= 5:
+                break
 
         # Fallback if no individual cards were matched: extract main newsroom page
         if not press_items:
