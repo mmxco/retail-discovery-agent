@@ -122,6 +122,10 @@ TECH_SIGNATURES: Dict[str, List[str]] = {
 
 # Heuristic URL Pattern Matchers for Target Discovery
 LINK_PATTERNS = {
+    "about": re.compile(
+        r"(about-us|about-company|about-our-company|about-the-company|our-story|who-we-are|company-overview|heritage|our-history|about-brand|our-heritage|about)",
+        re.I
+    ),
     "press": re.compile(
         r"(press|newsroom|news-releases|press-releases|investor|investors|media-center|corporate-news)",
         re.I
@@ -169,13 +173,17 @@ class PressReleaseItem:
 
 @dataclass
 class ScrapeResult:
-    """Structured result returned by the legacy synchronous scraping bridge."""
+    """Structured result returned by the scraping bridge."""
     url: str
     title: str = ""
     markdown: str = ""
     meta_description: str = ""
     meta_keywords: str = ""
     tech_signals: List[str] = field(default_factory=list)
+    about_us_content: Dict[str, Any] = field(default_factory=dict)
+    leadership_content: Dict[str, Any] = field(default_factory=dict)
+    press_releases: List[Dict[str, str]] = field(default_factory=list)
+    crawl_payload: Dict[str, Any] = field(default_factory=dict)
     engine_used: str = "playwright"
     success: bool = True
     error_message: Optional[str] = None
@@ -188,6 +196,9 @@ class ScrapeResult:
             "tech_signals": self.tech_signals,
             "markdown_char_count": len(self.markdown),
             "markdown_content": self.markdown,
+            "about_us_content": self.about_us_content,
+            "leadership_content": self.leadership_content,
+            "press_releases": self.press_releases,
             "engine_used": self.engine_used,
             "success": self.success,
         }
@@ -356,15 +367,7 @@ class ApparelDiscoveryCrawler:
             timezone_id="America/New_York",
             ignore_https_errors=True,
             extra_http_headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Ch-Ua": '"Chromium";v="133", "Not(A:Brand";v="99"',
-                "Sec-Ch-Ua-Mobile": "?0",
-                "Sec-Ch-Ua-Platform": '"Windows"',
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Upgrade-Insecure-Requests": "1",
             }
         )
 
@@ -372,28 +375,42 @@ class ApparelDiscoveryCrawler:
         await context.add_init_script(EVASION_INIT_SCRIPT)
         return browser, context
 
-    async def fetch_page(self, context: BrowserContext, url: str) -> Tuple[str, str, int]:
+    async def fetch_page(self, context: BrowserContext, url: str, custom_timeout_ms: Optional[int] = None) -> Tuple[str, str, int]:
         """
         Navigates to a URL using domcontentloaded and a brief hydration wait.
+        Handles WAF bot-verification interstitials (e.g. Imperva istlWasHere)
+        and scrolls to trigger lazy-loaded footers where corporate links reside.
         Returns (raw_html, final_url, status_code).
         """
         page: Page = await context.new_page()
+        effective_timeout = custom_timeout_ms if custom_timeout_ms is not None else self.timeout_ms
         try:
-            logger.info(f"Navigating to {url}...")
+            # Upgrade insecure HTTP links to HTTPS to avoid HTTP2 protocol errors
+            if url.startswith("http://") and not url.startswith("http://127.0.0.1") and not url.startswith("http://localhost"):
+                url = "https://" + url[7:]
+
+            logger.info(f"Navigating to {url} (timeout: {effective_timeout}ms)...")
             response = await page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=self.timeout_ms
+                timeout=effective_timeout
             )
             status_code = response.status if response else 0
 
-            # Allow brief client-side hydration for dynamic SPAs
-            await page.wait_for_timeout(1000)
+            # 1. Handle WAF/Bot verification challenges (e.g., Imperva istlWasHere, Cloudflare, PerimeterX)
+            for _ in range(6):
+                html_check = await page.content()
+                if "istlWasHere" not in html_check and len(html_check) > 300000:
+                    break
+                await page.wait_for_timeout(1000)
 
-            # Scroll to trigger lazy-loaded footers where corporate & press links reside
+            # 2. Allow dynamic SPA client-side hydration (critical for React/Next.js mounting)
+            await page.wait_for_timeout(2500)
+
+            # 3. Scroll to trigger lazy-loaded footers where corporate & press links reside
             try:
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(2500)
             except Exception:
                 pass
 
@@ -401,8 +418,11 @@ class ApparelDiscoveryCrawler:
             html = await page.content()
             return html, final_url, status_code
         except PlaywrightTimeoutError:
-            logger.warning(f"Timeout occurred loading {url} (after {self.timeout_ms}ms). Capturing partial DOM.")
-            html = await page.content()
+            logger.warning(f"Timeout occurred loading {url} (after {effective_timeout}ms). Capturing partial DOM.")
+            try:
+                html = await page.content()
+            except Exception:
+                html = ""
             return html, page.url, 408
         except Exception as e:
             logger.error(f"Navigation failure on {url}: {e}")
@@ -413,16 +433,18 @@ class ApparelDiscoveryCrawler:
     def discover_target_links(self, base_url: str, html: str) -> Dict[str, List[str]]:
         """
         Discovers and resolves navigation, footer, and body links
-        matching press, leadership, and technology heuristic patterns.
+        matching about, press, leadership, and technology heuristic patterns.
+        Ranks candidates so parent landing pages are prioritized over sub-features.
         """
         soup = BeautifulSoup(html, "html.parser")
         parsed_base = urlparse(base_url)
         base_domain = parsed_base.netloc.lower().replace("www.", "")
 
-        discovered: Dict[str, Set[str]] = {
-            "press": set(),
-            "leadership": set(),
-            "technology": set(),
+        discovered_candidates: Dict[str, List[Tuple[int, str]]] = {
+            "about": [],
+            "press": [],
+            "leadership": [],
+            "technology": [],
         }
 
         # Scan all anchors
@@ -446,12 +468,95 @@ class ApparelDiscoveryCrawler:
             # Check matching against patterns using both href and anchor text
             link_text = a.get_text(" ", strip=True)
             searchable_target = f"{resolved_url} {link_text}"
+            norm_path = parsed_res.path.rstrip("/").lower()
+            norm_text = link_text.lower()
 
             for category, pattern in LINK_PATTERNS.items():
                 if pattern.search(searchable_target):
-                    discovered[category].add(resolved_url)
+                    # Disambiguate: don't classify leadership links as generic about-us
+                    if category == "about" and LINK_PATTERNS["leadership"].search(searchable_target):
+                        continue
 
-        return {k: sorted(list(v)) for k, v in discovered.items()}
+                    # Score candidate priority (higher score = better primary match)
+                    score = 10
+                    if category == "about":
+                        # Ideal About Us root landing pages (like /browse/about, /about-us, /about, /our-story)
+                        if norm_path in ["/about", "/about-us", "/our-story", "/browse/about", "/who-we-are", "/about/our-story"]:
+                            score += 100
+                        if norm_text in ["about us", "about", "our story", "who we are", "about nordstrom", "about our company"]:
+                            score += 80
+                        elif "about" in norm_text:
+                            score += 40
+
+                        # Penalize peripheral sub-features
+                        if re.search(r"(podcast|restaurant|spa|app|media-network|credit|card|socialmedia|career|job|press|investor)", norm_path, re.I):
+                            score -= 70
+                        if re.search(r"(podcast|restaurant|spa|app|media network|card|rewards)", norm_text, re.I):
+                            score -= 70
+
+                    elif category == "leadership":
+                        if norm_path in ["/leadership", "/our-team", "/our-leadership", "/about-us/team", "/executives", "/board-of-directors"]:
+                            score += 100
+                        if norm_text in ["leadership", "our leaders", "executive team", "board of directors", "our team"]:
+                            score += 80
+
+                    elif category == "press":
+                        if norm_path in ["/press", "/press-releases", "/newsroom", "/news-releases", "/investors/press-releases"]:
+                            score += 100
+                        if norm_text in ["press releases", "newsroom", "press", "media center"]:
+                            score += 80
+
+                    discovered_candidates[category].append((score, resolved_url))
+
+        # Sort each category by score descending, then deduplicate preserving highest score
+        result: Dict[str, List[str]] = {}
+        for cat, items in discovered_candidates.items():
+            items.sort(key=lambda x: x[0], reverse=True)
+            seen: Set[str] = set()
+            ranked_urls: List[str] = []
+            for score, u in items:
+                if u not in seen:
+                    seen.add(u)
+                    ranked_urls.append(u)
+            result[cat] = ranked_urls
+
+        return result
+
+    def extract_about_us(self, html: str, page_url: str) -> Dict[str, Any]:
+        """
+        Extracts narrative and key milestone/company facts from an About Us DOM.
+        Returns a dict with source_url, markdown_text, and structured key_facts.
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        container = sanitize_dom(soup, target_semantic_container=True)
+        text_md = convert_dom_to_markdown(container)[:6000]
+
+        # Extract structured key facts, milestones, or core statistics
+        key_facts: List[str] = []
+        fact_patterns = re.compile(
+            r"(founded|headquarter|stores|locations|employees|associates|heritage|mission|since\s+\d{4}|\b\d{4}\b|revenue|global|distribution|channels)",
+            re.I
+        )
+
+        for elem in container.find_all(["li", "p"]):
+            text = elem.get_text(" ", strip=True)
+            sentences = re.split(r"(?<=[.!?])\s+", text) if len(text) > 400 else [text]
+            for s in sentences:
+                line = s.strip()
+                if 25 <= len(line) <= 450 and fact_patterns.search(line):
+                    cleaned_line = re.sub(r"\s+", " ", line).strip()
+                    if cleaned_line not in key_facts:
+                        key_facts.append(cleaned_line)
+                    if len(key_facts) >= 8:
+                        break
+            if len(key_facts) >= 8:
+                break
+
+        return {
+            "source_url": page_url,
+            "markdown_text": text_md,
+            "key_facts": key_facts[:8],
+        }
 
     def extract_press_releases(self, html: str, page_url: str) -> List[PressReleaseItem]:
         """
@@ -507,9 +612,10 @@ class ApparelDiscoveryCrawler:
         """
         Executes end-to-end extraction across the target apparel domain:
         1. Crawls homepage, extracts tech signatures and discovers corporate links.
-        2. Crawls Leadership/Executive page.
-        3. Crawls Press/Newsroom page.
-        4. Compiles structured JSON meeting all engineering specifications.
+        2. Crawls About Us / Company Overview page.
+        3. Crawls Leadership/Executive page.
+        4. Crawls Press/Newsroom page.
+        5. Compiles structured JSON meeting all engineering specifications.
         """
         # Normalize URL
         if not domain_or_url.startswith(("http://", "https://", "file://", "data:")):
@@ -539,8 +645,9 @@ class ApparelDiscoveryCrawler:
                         "error": f"Failed to connect to {base_url} (HTTP {status})",
                     }
 
-                home_soup = BeautifulSoup(home_html, "html.parser")
-                tech_signals = detect_tech_signals(home_soup, raw_html=home_html)
+                # Extract tech signals, metadata, and clean markdown from homepage
+                home_soup, home_metadata, tech_signals = clean_html_dom(home_html)
+                home_markdown = html_to_clean_markdown(home_soup)
 
                 # Classify tech footprint
                 ecommerce_platform = "Custom / In-House Headless"
@@ -555,48 +662,74 @@ class ApparelDiscoveryCrawler:
                     else:
                         detected_frameworks.append(signal)
 
-                # Discover candidate corporate sub-URLs
+                # Discover candidate corporate sub-URLs from raw DOM before decomposition
                 discovered_links = self.discover_target_links(final_home_url, home_html)
                 logger.info(f"Discovered target link candidates for {clean_domain}: {discovered_links}")
 
                 # -------------------------------------------------------------
-                # STEP 2: Crawl Leadership / Executive Notes
+                # STEP 2: Crawl About Us & Company Overview
+                # -------------------------------------------------------------
+                about_us_content: Dict[str, Any] = {
+                    "source_url": "",
+                    "markdown_text": "",
+                    "key_facts": []
+                }
+
+                subpage_timeout = min(self.timeout_ms, 15000)
+
+                if discovered_links.get("about"):
+                    for target_about_url in discovered_links["about"][:2]:
+                        logger.info(f"Navigating to About Us target: {target_about_url}")
+                        about_html, about_final_url, _ = await self.fetch_page(context, target_about_url, custom_timeout_ms=subpage_timeout)
+                        if about_html:
+                            candidate_data = self.extract_about_us(about_html, about_final_url)
+                            if candidate_data.get("markdown_text"):
+                                about_us_content = candidate_data
+                                break
+
+                # -------------------------------------------------------------
+                # STEP 3: Crawl Leadership / Executive Notes
                 # -------------------------------------------------------------
                 leadership_content: Dict[str, str] = {
                     "source_url": "",
                     "markdown_text": ""
                 }
 
-                if discovered_links["leadership"]:
-                    target_lead_url = discovered_links["leadership"][0]
-                    logger.info(f"Navigating to Leadership target: {target_lead_url}")
-                    lead_html, lead_final_url, _ = await self.fetch_page(context, target_lead_url)
-                    if lead_html:
-                        lead_soup = BeautifulSoup(lead_html, "html.parser")
-                        container = sanitize_dom(lead_soup, target_semantic_container=True)
-                        leadership_content["source_url"] = lead_final_url
-                        leadership_content["markdown_text"] = convert_dom_to_markdown(container)[:6000]
+                if discovered_links.get("leadership"):
+                    for target_lead_url in discovered_links["leadership"][:2]:
+                        logger.info(f"Navigating to Leadership target: {target_lead_url}")
+                        lead_html, lead_final_url, _ = await self.fetch_page(context, target_lead_url, custom_timeout_ms=subpage_timeout)
+                        if lead_html:
+                            lead_soup = BeautifulSoup(lead_html, "html.parser")
+                            container = sanitize_dom(lead_soup, target_semantic_container=True)
+                            md_text = convert_dom_to_markdown(container)[:6000]
+                            if md_text:
+                                leadership_content["source_url"] = lead_final_url
+                                leadership_content["markdown_text"] = md_text
+                                break
 
                 # -------------------------------------------------------------
-                # STEP 3: Crawl Press Releases & Investor Relations
+                # STEP 4: Crawl Press Releases & Investor Relations
                 # -------------------------------------------------------------
                 press_releases: List[Dict[str, str]] = []
 
-                if discovered_links["press"]:
-                    target_press_url = discovered_links["press"][0]
-                    logger.info(f"Navigating to Press / Newsroom target: {target_press_url}")
-                    press_html, press_final_url, _ = await self.fetch_page(context, target_press_url)
-                    if press_html:
-                        extracted_press = self.extract_press_releases(press_html, press_final_url)
-                        press_releases = [item.to_dict() for item in extracted_press]
+                if discovered_links.get("press"):
+                    for target_press_url in discovered_links["press"][:2]:
+                        logger.info(f"Navigating to Press / Newsroom target: {target_press_url}")
+                        press_html, press_final_url, _ = await self.fetch_page(context, target_press_url, custom_timeout_ms=subpage_timeout)
+                        if press_html:
+                            extracted_press = self.extract_press_releases(press_html, press_final_url)
+                            if extracted_press:
+                                press_releases = [item.to_dict() for item in extracted_press]
+                                break
 
                 # -------------------------------------------------------------
-                # STEP 4: Secondary Scan on Careers/Tech page for Stack Footprint
+                # STEP 5: Secondary Scan on Careers/Tech page for Stack Footprint
                 # -------------------------------------------------------------
                 if discovered_links["technology"]:
                     tech_url = discovered_links["technology"][0]
                     logger.info(f"Scanning Technology/Careers page for stack indicators: {tech_url}")
-                    tech_html, _, _ = await self.fetch_page(context, tech_url)
+                    tech_html, _, _ = await self.fetch_page(context, tech_url, custom_timeout_ms=subpage_timeout)
                     if tech_html:
                         additional_signals = detect_tech_signals(BeautifulSoup(tech_html, "html.parser"), raw_html=tech_html)
                         for sig in additional_signals:
@@ -609,11 +742,19 @@ class ApparelDiscoveryCrawler:
                 aggregated_output = {
                     "domain": clean_domain,
                     "crawl_timestamp": timestamp,
+                    "page_title": home_metadata.get("title", ""),
+                    "meta_description": home_metadata.get("meta_description", ""),
                     "tech_footprint": {
                         "ecommerce_platform": ecommerce_platform,
                         "analytics_tagging": sorted(list(set(analytics_tagging))),
                         "detected_frameworks": sorted(list(set(detected_frameworks))),
                     },
+                    "homepage_content": {
+                        "source_url": final_home_url,
+                        "char_count": len(home_markdown),
+                        "markdown_text": home_markdown[:6000],
+                    },
+                    "about_us_content": about_us_content,
                     "leadership_content": leadership_content,
                     "press_releases": press_releases,
                 }
@@ -628,24 +769,128 @@ class ApparelDiscoveryCrawler:
 # ==============================================================================
 # SYNCHRONOUS BACKWARD COMPATIBILITY BRIDGE (FOR app.py & PIPELINE)
 # ==============================================================================
+# PLAYWRIGHT HEALTH & RESTART UTILITIES
+# ==============================================================================
+
+def check_playwright_availability() -> Tuple[bool, str]:
+    """
+    Verifies that Playwright is installed and Chromium Headless Browser can launch.
+    Returns (True, message) if operational, or (False, error_reason) if unavailable.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-setuid-sandbox",
+                ]
+            )
+            browser.close()
+        return True, "Playwright Headless Browser is operational."
+    except Exception as err:
+        return False, f"Playwright Headless Browser unavailable: {err}"
+
+
+def restart_playwright() -> Tuple[bool, str]:
+    """
+    Attempts to reinstall/repair Playwright Chromium browser binaries.
+    """
+    import subprocess
+    try:
+        res = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if res.returncode == 0:
+            return True, "Playwright Chromium browser binaries successfully reinstalled/restarted."
+        else:
+            return False, f"Playwright restart failed with code {res.returncode}: {res.stderr or res.stdout}"
+    except Exception as err:
+        return False, f"Playwright restart process failed: {err}"
+
+
+# ==============================================================================
+# SYNCHRONOUS ENTRY POINT FOR PIPELINE (STRICT PLAYWRIGHT HEADLESS)
+# ==============================================================================
 
 def scrape_retail_site(
     url: str,
     prefer_playwright: bool = True,
     timeout_ms: int = 30000,
+    deep_crawl: bool = True,
 ) -> ScrapeResult:
     """
-    Synchronous entry point compatible with app.py and existing pipeline calls.
-    Invokes Playwright synchronously or falls back cleanly to HTTP session.
+    Synchronous entry point compatible with app.py and pipeline calls.
+    Strictly uses Playwright Headless Browser for multi-page apparel discovery or
+    single-page extraction. Does not fall back to plain HTTP requests.
     """
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
     parsed = urlparse(url)
     if not parsed.scheme:
         url = f"https://{url}"
 
+    # Verify Playwright availability
+    pw_ok, pw_msg = check_playwright_availability()
+    if not pw_ok:
+        logger.error(f"Playwright Headless Browser unavailable for URL {url}: {pw_msg}")
+        return ScrapeResult(
+            url=url,
+            success=False,
+            engine_used="none",
+            error_message=f"Playwright Headless Browser is unavailable: {pw_msg}",
+        )
+
+    # 1. Preferred Path: Full Multi-Page Deep Crawl via Playwright
+    if deep_crawl:
+        try:
+            crawler = ApparelDiscoveryCrawler(timeout_ms=timeout_ms)
+            try:
+                asyncio.get_running_loop()
+                in_loop = True
+            except RuntimeError:
+                in_loop = False
+
+            if in_loop:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    crawl_data = pool.submit(
+                        asyncio.run, crawler.crawl_apparel_domain(url)
+                    ).result()
+            else:
+                crawl_data = asyncio.run(crawler.crawl_apparel_domain(url))
+
+            if not crawl_data.get("error"):
+                tech_fp = crawl_data.get("tech_footprint", {})
+                detected_sigs = set(
+                    tech_fp.get("analytics_tagging", [])
+                    + tech_fp.get("detected_frameworks", [])
+                )
+                if tech_fp.get("ecommerce_platform") and tech_fp["ecommerce_platform"] != "Custom / In-House Headless":
+                    detected_sigs.add(tech_fp["ecommerce_platform"])
+
+                return ScrapeResult(
+                    url=url,
+                    title=crawl_data.get("page_title", ""),
+                    markdown=crawl_data.get("homepage_content", {}).get("markdown_text", ""),
+                    meta_description=crawl_data.get("meta_description", ""),
+                    meta_keywords="",
+                    tech_signals=sorted(list(detected_sigs)),
+                    about_us_content=crawl_data.get("about_us_content", {}),
+                    leadership_content=crawl_data.get("leadership_content", {}),
+                    press_releases=crawl_data.get("press_releases", []),
+                    crawl_payload=crawl_data,
+                    engine_used="playwright_deep_crawler",
+                    success=True,
+                )
+        except Exception as deep_err:
+            logger.warning(f"Deep crawl execution note: {deep_err}. Attempting single-page Playwright...")
+
+    # 2. Targeted Single-Page Playwright Scraper
     def _run_playwright_sync(target_url: str, timeout: int) -> Tuple[str, Dict[str, str], List[str]]:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
@@ -666,71 +911,43 @@ def scrape_retail_site(
                 ignore_https_errors=True,
             )
             page = context.new_page()
+            raw_html = ""
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=timeout)
                 page.wait_for_timeout(1000)
                 raw_html = page.content()
+            except Exception as nav_err:
+                logger.warning(
+                    f"Playwright sync navigation timeout or error on {target_url} (timeout: {timeout}ms): {nav_err}. "
+                    "Attempting partial content capture..."
+                )
+                try:
+                    raw_html = page.content()
+                except Exception:
+                    raw_html = ""
             finally:
                 context.close()
                 browser.close()
 
         soup, meta, signals = clean_html_dom(raw_html)
-        return raw_html, meta, signals
+        markdown_text = html_to_clean_markdown(soup)
+        return markdown_text, meta, signals
 
-    if prefer_playwright:
-        try:
-            try:
-                asyncio.get_running_loop()
-                in_loop = True
-            except RuntimeError:
-                in_loop = False
-
-            if in_loop:
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    raw_html, metadata, tech_signals = pool.submit(
-                        _run_playwright_sync, url, timeout_ms
-                    ).result()
-            else:
-                raw_html, metadata, tech_signals = _run_playwright_sync(url, timeout_ms)
-
-            markdown_content = html_to_clean_markdown(BeautifulSoup(raw_html, "html.parser"))
-            return ScrapeResult(
-                url=url,
-                title=metadata.get("title", ""),
-                markdown=markdown_content,
-                meta_description=metadata.get("meta_description", ""),
-                meta_keywords=metadata.get("meta_keywords", ""),
-                tech_signals=tech_signals,
-                engine_used="playwright",
-                success=True,
-            )
-        except Exception as e:
-            logger.warning(f"Playwright execution note: {e}. Falling back to HTTP requests scraper.")
-
-    # Resilient HTTP fallback
     try:
-        session = requests.Session()
-        retries = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS"],
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
 
-        headers = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        resp = session.get(url, headers=headers, timeout=int(timeout_ms / 1000))
-        resp.raise_for_status()
-
-        cleaned_soup, metadata, tech_signals = clean_html_dom(resp.text)
-        markdown_content = html_to_clean_markdown(cleaned_soup)
+        if in_loop:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                markdown_content, metadata, tech_signals = pool.submit(
+                    _run_playwright_sync, url, timeout_ms
+                ).result()
+        else:
+            markdown_content, metadata, tech_signals = _run_playwright_sync(url, timeout_ms)
 
         return ScrapeResult(
             url=url,
@@ -739,15 +956,16 @@ def scrape_retail_site(
             meta_description=metadata.get("meta_description", ""),
             meta_keywords=metadata.get("meta_keywords", ""),
             tech_signals=tech_signals,
-            engine_used="requests_fallback",
+            engine_used="playwright",
             success=True,
         )
-    except Exception as fe:
+    except Exception as e:
+        logger.error(f"Playwright Headless Browser execution error: {e}")
         return ScrapeResult(
             url=url,
             success=False,
-            engine_used="none",
-            error_message=str(fe),
+            engine_used="playwright",
+            error_message=f"Playwright Headless Browser failed to render page: {e}",
         )
 
 

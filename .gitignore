@@ -32,6 +32,8 @@ ENV/
 .env.*
 secrets.toml
 .streamlit/secrets.toml
+token.json
+client_secret*.json
 
 # IDE & OS
 .vscode/

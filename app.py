@@ -21,13 +21,22 @@ except Exception:
 import streamlit as st
 
 from models import DiscoveryDossier
-from scraper import scrape_retail_site
+from scraper import scrape_retail_site, check_playwright_availability, restart_playwright
 from analyzer import analyze_retail_prospect
 from exporter import (
     export_dossier_to_google_doc,
     export_dossier_to_markdown,
     validate_service_account,
+    verify_client_secret,
+    get_user_oauth_credentials,
+    get_authenticated_user_info,
+    clear_oauth_token,
+    start_oauth_desktop_flow,
     get_google_credentials,
+    extract_folder_id,
+    list_drive_folders,
+    validate_drive_folder,
+    create_drive_folder,
 )
 
 # -----------------------------------------------------------------------------
@@ -66,6 +75,24 @@ st.markdown("""
     }
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
+    }
+    /* Dial down st.metric sizing and prevent truncation */
+    [data-testid="stMetricLabel"] {
+        font-size: 0.85rem !important;
+        font-weight: 500 !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.15rem !important;
+        line-height: 1.35 !important;
+    }
+    [data-testid="stMetricValue"] > div,
+    [data-testid="stMetricValue"] * {
+        font-size: 1.15rem !important;
+        line-height: 1.35 !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: unset !important;
+        word-break: break-word !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -142,82 +169,479 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("2. Google Docs Integration")
-    google_creds_option = st.radio(
-        "Credentials Source",
-        options=["Application Default (ADC) / Environment", "Upload Service Account JSON", "Skip Google Docs (Local Markdown Only)"],
-        index=0,
-    )
 
+    oauth_creds = None
     service_account_json_content = None
-    if google_creds_option == "Upload Service Account JSON":
-        uploaded_sa = st.file_uploader("Service Account JSON", type=["json"], help="Upload GCP Service Account JSON key.")
-        if uploaded_sa:
-            uploaded_sa.seek(0)
-            raw_content = uploaded_sa.read().decode("utf-8")
-            with st.spinner("Validating Service Account credentials..."):
-                val = validate_service_account(raw_content)
+    adc = None
 
-            if val["valid"]:
-                service_account_json_content = raw_content
-                st.session_state["service_account_json_content"] = raw_content
-                st.session_state["service_account_project_id"] = val.get("project_id", "")
-                st.session_state["service_account_client_email"] = val.get("client_email", "")
-                if val.get("handshake_successful"):
+    with st.expander("🔑 Credentials Source & Auth Setup", expanded=False):
+        google_creds_option = st.radio(
+            "Credentials Source",
+            options=[
+                "OAuth 2.0 User Credentials (Desktop App) [Recommended]",
+                "Upload Service Account JSON (Legacy)",
+                "Application Default (ADC) / Environment",
+                "Skip Google Docs (Local Markdown Only)",
+            ],
+            index=0,
+            key="google_creds_option_radio",
+        )
+
+        if google_creds_option == "OAuth 2.0 User Credentials (Desktop App) [Recommended]":
+            local_cs_exists = os.path.isfile("client_secret.json")
+            if local_cs_exists and "oauth_client_secret_json" not in st.session_state:
+                try:
+                    with open("client_secret.json", "r", encoding="utf-8") as cs_file:
+                        st.session_state["oauth_client_secret_json"] = cs_file.read()
+                except Exception:
+                    pass
+
+            uploaded_cs = st.file_uploader(
+                "OAuth 2.0 Client Secret (client_secret.json)",
+                type=["json"],
+                help="Upload your Google Cloud OAuth 2.0 Client Secret JSON (Desktop App configuration).",
+            )
+            if uploaded_cs:
+                uploaded_cs.seek(0)
+                st.session_state["oauth_client_secret_json"] = uploaded_cs.read().decode("utf-8")
+
+            raw_cs = st.session_state.get("oauth_client_secret_json")
+            v_secret = verify_client_secret(raw_cs) if raw_cs else None
+
+            if v_secret:
+                if v_secret["valid"]:
                     st.success(
-                        f"✅ **Authenticated & Verified**\n\n"
-                        f"• **Account:** `{val['client_email']}`\n\n"
-                        f"• **Project:** `{val['project_id']}`"
+                        f"✅ **Client Secret Verified ({v_secret['app_type']})**\n\n"
+                        f"• **Project:** `{v_secret['project_id'] or 'detected'}`\n\n"
+                        f"• **Client ID:** `{v_secret['client_id'][:28]}...`"
                     )
                 else:
-                    st.info(
-                        f"ℹ️ **Credentials Structure Valid**\n\n"
-                        f"• **Account:** `{val['client_email']}`\n\n"
-                        f"• **Project:** `{val['project_id']}`"
-                    )
-                    if val.get("warning"):
-                        st.caption(f"Note: {val['warning']}")
-            else:
-                service_account_json_content = None
-                if "service_account_json_content" in st.session_state:
-                    del st.session_state["service_account_json_content"]
-                st.error(f"❌ **Invalid Service Account:**\n\n{val['error']}")
-        else:
-            if "service_account_json_content" in st.session_state:
-                del st.session_state["service_account_json_content"]
-    elif google_creds_option == "Application Default (ADC) / Environment":
-        adc = get_google_credentials()
-        if adc:
-            st.caption("✅ Google Cloud credentials detected in environment.")
-        else:
-            st.caption("ℹ️ No default GCP credentials detected. Upload a Service Account JSON above or use local Markdown export.")
+                    st.error(f"❌ **Invalid Client Secret:**\n\n{v_secret['error']}")
+            elif not local_cs_exists:
+                st.info("ℹ️ Upload a `client_secret.json` from Google Cloud Console (APIs & Services > Credentials > OAuth Client ID: Desktop App).")
 
-    folder_id_input = ""
+            # Inspect token lifecycle
+            oauth_creds = get_user_oauth_credentials(
+                client_secret_json=raw_cs,
+                run_flow_if_needed=False,
+            )
+
+            if oauth_creds and oauth_creds.valid:
+                if "oauth_user_info" not in st.session_state or not st.session_state.get("oauth_user_info"):
+                    st.session_state["oauth_user_info"] = get_authenticated_user_info(oauth_creds)
+                u_info = st.session_state.get("oauth_user_info", {})
+                u_email = u_info.get("email") or "Authenticated User"
+                u_name = u_info.get("display_name")
+                display_str = f"**{u_name}** (`{u_email}`)" if u_name else f"`{u_email}`"
+                st.markdown(
+                    f"<div style='background-color:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; padding:10px 14px; margin-bottom:10px;'>"
+                    f"👤 <strong>Signed In with Google:</strong><br/>"
+                    f"<span style='color:#15803d; font-weight:600;'>{display_str}</span><br/>"
+                    f"<span style='color:#65a30d; font-size:12px;'>Documents will be saved in your personal Google Drive (15 GB+ quota).</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if st.button("🔄 Sign Out / Switch Google Account", width='stretch'):
+                    clear_oauth_token()
+                    if "oauth_user_info" in st.session_state:
+                        del st.session_state["oauth_user_info"]
+                    if "oauth_flow_server" in st.session_state:
+                        try:
+                            st.session_state["oauth_flow_server"].shutdown()
+                        except Exception:
+                            pass
+                        del st.session_state["oauth_flow_server"]
+                    st.rerun()
+            else:
+                flow_server = st.session_state.get("oauth_flow_server")
+                if flow_server is not None:
+                    # Check if background thread or manual exchange completed
+                    if flow_server.is_authenticated or os.path.isfile("token.json"):
+                        fresh_creds = get_user_oauth_credentials(token_path="token.json", run_flow_if_needed=False)
+                        if fresh_creds and fresh_creds.valid:
+                            st.session_state["oauth_user_info"] = get_authenticated_user_info(fresh_creds)
+                            try:
+                                flow_server.shutdown()
+                            except Exception:
+                                pass
+                            del st.session_state["oauth_flow_server"]
+                            st.success("Successfully authenticated with Google!")
+                            st.rerun()
+                    elif flow_server.error:
+                        st.error(f"❌ **Authentication Note:** {flow_server.error}")
+                        if st.button("🔄 Restart Sign-In", width='stretch'):
+                            try:
+                                flow_server.shutdown()
+                            except Exception:
+                                pass
+                            del st.session_state["oauth_flow_server"]
+                            st.rerun()
+                    else:
+                        # Non-blocking active authorization state
+                        st.markdown(
+                            "<div style='background-color:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; padding:10px 12px; margin-bottom:12px;'>"
+                            "<strong style='color:#1e40af;'>🔐 Google Sign-In Ready</strong><br/>"
+                            "<span style='font-size:12px; color:#1e3a8a;'>"
+                            "Click below to open Google Sign-In in a new Chrome tab. "
+                            "Sign in, allow Drive access, then return here."
+                            "</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        st.link_button(
+                            "🌐 Open Google Sign-In in New Tab ↗",
+                            url=flow_server.auth_url,
+                            type="primary",
+                            width='stretch',
+                        )
+
+                        c_auth1, c_auth2 = st.columns([1, 1])
+                        with c_auth1:
+                            if st.button("🔄 Check Login Status", width='stretch', help="Check if sign-in is complete in your browser"):
+                                fresh_creds = get_user_oauth_credentials(token_path="token.json", run_flow_if_needed=False)
+                                if (flow_server.is_authenticated or os.path.isfile("token.json")) and fresh_creds and fresh_creds.valid:
+                                    st.session_state["oauth_user_info"] = get_authenticated_user_info(fresh_creds)
+                                    try:
+                                        flow_server.shutdown()
+                                    except Exception:
+                                        pass
+                                    del st.session_state["oauth_flow_server"]
+                                    st.success("Successfully authenticated!")
+                                    st.rerun()
+                                else:
+                                    st.info("Waiting for Google authorization in browser...")
+                        with c_auth2:
+                            if st.button("❌ Cancel", width='stretch'):
+                                try:
+                                    flow_server.shutdown()
+                                except Exception:
+                                    pass
+                                del st.session_state["oauth_flow_server"]
+                                st.rerun()
+
+                        with st.expander("Trouble with automatic redirect? Click here"):
+                            st.caption(
+                                "If your browser cannot connect to `localhost` after signing in, copy the final URL from your "
+                                "browser's address bar (or the `code=` parameter value) and paste it below:"
+                            )
+                            pasted_auth = st.text_input("Redirect URL or Code", key="oauth_pasted_manual_code", placeholder="http://localhost:.../?code=4/0A...")
+                            if st.button("Submit Code / URL", width='stretch'):
+                                if pasted_auth and flow_server.manual_exchange(pasted_auth):
+                                    fresh_creds = get_user_oauth_credentials(token_path="token.json", run_flow_if_needed=False)
+                                    if fresh_creds and fresh_creds.valid:
+                                        st.session_state["oauth_user_info"] = get_authenticated_user_info(fresh_creds)
+                                        try:
+                                            flow_server.shutdown()
+                                        except Exception:
+                                            pass
+                                        del st.session_state["oauth_flow_server"]
+                                        st.success("Successfully authenticated!")
+                                        st.rerun()
+                                else:
+                                    st.error(f"Failed to exchange code: {flow_server.error or 'Invalid authorization input'}")
+                else:
+                    if v_secret and v_secret["valid"]:
+                        if st.button("🔑 Sign In with Google Account", type="primary", width='stretch'):
+                            try:
+                                cs_cfg = v_secret.get("client_config") or raw_cs
+                                server = start_oauth_desktop_flow(client_secret_data_or_path=cs_cfg)
+                                st.session_state["oauth_flow_server"] = server
+                                st.rerun()
+                            except Exception as flow_err:
+                                st.error(f"❌ Failed to start authorization flow: {flow_err}")
+                    else:
+                        st.caption("ℹ️ Upload and verify a `client_secret.json` to enable Google Sign-In.")
+
+        elif google_creds_option == "Upload Service Account JSON (Legacy)":
+            uploaded_sa = st.file_uploader("Service Account JSON", type=["json"], help="Upload GCP Service Account JSON key.")
+            if uploaded_sa:
+                uploaded_sa.seek(0)
+                raw_content = uploaded_sa.read().decode("utf-8")
+                if raw_content != st.session_state.get("service_account_json_content"):
+                    with st.spinner("Validating Service Account credentials..."):
+                        val = validate_service_account(raw_content)
+
+                    if val["valid"]:
+                        service_account_json_content = raw_content
+                        st.session_state["service_account_json_content"] = raw_content
+                        st.session_state["service_account_project_id"] = val.get("project_id", "")
+                        st.session_state["service_account_client_email"] = val.get("client_email", "")
+                        st.session_state["service_account_handshake"] = val.get("handshake_successful", False)
+                    else:
+                        service_account_json_content = None
+                        if "service_account_json_content" in st.session_state:
+                            del st.session_state["service_account_json_content"]
+                        st.error(f"❌ **Invalid Service Account:**\n\n{val['error']}")
+                else:
+                    service_account_json_content = raw_content
+            elif "service_account_json_content" in st.session_state:
+                service_account_json_content = st.session_state["service_account_json_content"]
+
+            if service_account_json_content:
+                sa_email = st.session_state.get("service_account_client_email", "")
+                sa_proj = st.session_state.get("service_account_project_id", "")
+                is_hs = st.session_state.get("service_account_handshake", True)
+                status_text = "Authenticated & Verified" if is_hs else "Credentials Structure Valid"
+                st.success(
+                    f"✅ **{status_text}**\n\n"
+                    f"• **Account:** `{sa_email}`\n\n"
+                    f"• **Project:** `{sa_proj}`"
+                )
+        elif google_creds_option == "Application Default (ADC) / Environment":
+            adc = get_google_credentials()
+            if adc:
+                st.caption("✅ Google Cloud credentials detected in environment.")
+            else:
+                st.caption("ℹ️ No default GCP credentials detected. Upload a client_secret or Service Account JSON above, or use local Markdown export.")
+
+    target_folder_id = st.session_state.get("target_folder_id", "")
+    target_folder_name = st.session_state.get("target_folder_name", "")
+    target_folder_url = st.session_state.get("target_folder_url", "")
     share_email_input = ""
+
     if google_creds_option != "Skip Google Docs (Local Markdown Only)":
-        with st.expander("📁 Drive Destination & Sharing (Optional)", expanded=False):
-            folder_id_input = st.text_input(
-                "Target Google Drive Folder ID",
-                value=st.session_state.get("target_folder_id", ""),
-                help="Paste the Folder ID from your Google Drive URL to place the created document inside a shared folder.",
+        st.markdown("---")
+        st.markdown("#### 📁 Drive Destination & Folder Browser")
+        active_sa_email = st.session_state.get("service_account_client_email", "")
+        is_oauth_mode = google_creds_option.startswith("OAuth 2.0")
+        oauth_active = bool(oauth_creds and oauth_creds.valid) if is_oauth_mode else False
+        sa_active = bool(service_account_json_content)
+        adc_active = bool(adc) if google_creds_option == "Application Default (ADC) / Environment" else False
+        creds_available = oauth_active or sa_active or adc_active
+
+        if not creds_available:
+            hint_str = "Sign in via OAuth 2.0 or upload Service Account credentials above to browse Google Drive folders."
+            st.info(f"ℹ️ {hint_str}")
+            manual_id = st.text_input(
+                "Target Google Drive Folder ID (Manual)",
+                value=target_folder_id,
+                help="Paste the Folder ID from your Google Drive URL.",
                 placeholder="1a2b3c4d5e...",
             )
-            st.session_state["target_folder_id"] = folder_id_input
+            if manual_id != target_folder_id:
+                st.session_state["target_folder_id"] = manual_id.strip()
+                st.session_state["target_folder_name"] = manual_id.strip()
+        else:
+            if oauth_active:
+                u_info = st.session_state.get("oauth_user_info", {})
+                u_email = u_info.get("email") or "Your Google Account"
+                st.markdown(
+                    f"<div style='background-color:#f0fdf4; padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:12px; border: 1px solid #bbf7d0;'>"
+                    f"👤 <strong>Active User Account:</strong> <code>{u_email}</code><br/>"
+                    f"<span style='color:#15803d;'>Documents created are owned by you with personal storage quota.</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            elif sa_active and active_sa_email:
+                st.markdown(
+                    f"<div style='background-color:#f1f5f9; padding:8px 12px; border-radius:6px; font-size:12px; margin-bottom:12px; border: 1px solid #cbd5e1;'>"
+                    f"🔑 <strong>Active Service Account:</strong> <code>{active_sa_email}</code><br/>"
+                    f"<span style='color:#64748b;'>Share existing Google Drive folders with this address as <strong>Editor</strong>.</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
-            share_email_input = st.text_input(
-                "Share Directly with Email",
-                value=st.session_state.get("share_recipient_email", ""),
-                help="Enter your Google Workspace or Gmail address to grant edit access to the generated brief.",
-                placeholder="you@company.com",
+            folder_mode = st.radio(
+                "Folder Selection Method",
+                options=["📂 Browse Accessible Folders", "🔗 Paste Folder Link / ID", "➕ Create New Folder"],
+                index=0,
+                key="folder_selection_mode",
             )
-            st.session_state["share_recipient_email"] = share_email_input
+
+            if folder_mode == "📂 Browse Accessible Folders":
+                col_b1, col_b2 = st.columns([3, 1])
+                with col_b1:
+                    st.caption("Select from available folders:")
+                with col_b2:
+                    if st.button("🔄 Refresh", help="Re-scan Google Drive for accessible folders", width='stretch'):
+                        st.session_state["drive_folders_cache"] = None
+
+                if st.session_state.get("drive_folders_cache") is None:
+                    with st.spinner("Querying Google Drive API for folders..."):
+                        f_data = list_drive_folders(
+                            oauth_credentials=oauth_creds if oauth_active else None,
+                            credentials_json=service_account_json_content,
+                        )
+                        st.session_state["drive_folders_cache"] = f_data
+                else:
+                    f_data = st.session_state.get("drive_folders_cache", {})
+
+                if not f_data.get("success", False):
+                    st.error(f"⚠️ {f_data.get('error')}")
+                else:
+                    folder_options = []
+                    for sd in f_data.get("shared_drives", []):
+                        folder_options.append((sd["id"], f"🗂️ [Shared Drive] {sd['name']}", sd.get("web_view_link", "")))
+                    for f in f_data.get("folders", []):
+                        folder_options.append((f["id"], f"📁 {f['name']}", f.get("web_view_link", "")))
+
+                    if folder_options:
+                        cur_target = st.session_state.get("target_folder_id", "")
+                        id_list = [opt[0] for opt in folder_options]
+                        selected_idx = id_list.index(cur_target) if cur_target in id_list else 0
+
+                        chosen_option = st.selectbox(
+                            "Target Destination Folder",
+                            options=folder_options,
+                            index=selected_idx,
+                            format_func=lambda x: x[1],
+                            help="Select an accessible Google Drive folder or Shared Drive.",
+                        )
+                        st.session_state["target_folder_id"] = chosen_option[0]
+                        st.session_state["target_folder_name"] = chosen_option[1]
+                        st.session_state["target_folder_url"] = chosen_option[2]
+                    else:
+                        if oauth_active:
+                            st.info(
+                                "ℹ️ **No App Folders Found**\n\n"
+                                "Under the `drive.file` scope, Google Drive lists folders created with this app. "
+                                "You can create a dedicated 'Retail Discovery Briefs' folder below, or export directly to root 'My Drive'."
+                            )
+                            if st.button("📁 Create 'Retail Discovery Briefs' Folder in Drive", type="primary", width='stretch'):
+                                with st.spinner("Creating 'Retail Discovery Briefs' folder in your Google Drive..."):
+                                    c_res = create_drive_folder(
+                                        folder_name="Retail Discovery Briefs",
+                                        oauth_credentials=oauth_creds,
+                                    )
+                                if c_res.get("success"):
+                                    st.session_state["target_folder_id"] = c_res["id"]
+                                    st.session_state["target_folder_name"] = f"📁 {c_res['name']}"
+                                    st.session_state["target_folder_url"] = c_res.get("web_view_link", "")
+                                    st.session_state["drive_folders_cache"] = None
+                                    st.success(f"✅ Folder **{c_res['name']}** created and selected!")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ {c_res.get('error')}")
+                        else:
+                            st.warning(
+                                f"⚠️ **No Shared Folders Detected**\n\n"
+                                f"Google Service Accounts have **0 MB** of personal Drive quota and cannot create files directly at root.\n\n"
+                                f"**Quick Resolution:**\n"
+                                f"1. In Google Drive, open or create a folder (e.g. *Retail Discovery Briefs*).\n"
+                                f"2. Click **Share** and add `{active_sa_email or 'your service account'}` as **Editor**.\n"
+                                f"3. Click **'🔄 Refresh'** above to select it!"
+                            )
+                            st.session_state["target_folder_id"] = ""
+                            st.session_state["target_folder_name"] = ""
+                            st.session_state["target_folder_url"] = ""
+
+            elif folder_mode == "🔗 Paste Folder Link / ID":
+                pasted_val = st.text_input(
+                    "Google Drive Folder URL or ID",
+                    value=st.session_state.get("raw_pasted_folder_input", st.session_state.get("target_folder_id", "")),
+                    placeholder="https://drive.google.com/drive/folders/1a2b... or 1a2b...",
+                    help="Paste any Google Drive folder URL or ID.",
+                    key="pasted_folder_input",
+                )
+                # Automatically extract folder ID whenever text is typed/pasted
+                if pasted_val.strip():
+                    st.session_state["raw_pasted_folder_input"] = pasted_val.strip()
+                    extracted_id = extract_folder_id(pasted_val.strip())
+                    if extracted_id:
+                        st.session_state["target_folder_id"] = extracted_id
+                        if not st.session_state.get("target_folder_name") or st.session_state.get("target_folder_name", "").startswith("📁 ID:"):
+                            st.session_state["target_folder_name"] = f"📁 ID: {extracted_id[:16]}..."
+
+                if st.button("🔍 Validate & Select Folder", width='stretch'):
+                    if pasted_val.strip():
+                        with st.spinner("Validating folder permissions with Google Drive API..."):
+                            v_res = validate_drive_folder(
+                                pasted_val.strip(),
+                                oauth_credentials=oauth_creds if oauth_active else None,
+                                credentials_json=service_account_json_content,
+                            )
+                        if v_res.get("valid"):
+                            st.session_state["target_folder_id"] = v_res["id"]
+                            st.session_state["target_folder_name"] = f"📁 {v_res['name']}"
+                            st.session_state["target_folder_url"] = v_res.get("web_view_link", "")
+                            st.session_state["folder_val_status"] = {"type": "success", "msg": f"✅ Verified folder: **{v_res['name']}**"}
+                            st.rerun()
+                        else:
+                            st.session_state["folder_val_status"] = {"type": "error", "msg": f"❌ {v_res.get('error')}"}
+                    else:
+                        st.session_state["target_folder_id"] = ""
+                        st.session_state["target_folder_name"] = "📁 [Default] My Drive (Root / No Folder)"
+                        st.session_state["target_folder_url"] = ""
+                        st.session_state["folder_val_status"] = {"type": "info", "msg": "Defaulting to root My Drive."}
+                        st.rerun()
+
+                if "folder_val_status" in st.session_state:
+                    f_stat = st.session_state["folder_val_status"]
+                    if f_stat["type"] == "success":
+                        st.success(f_stat["msg"])
+                    elif f_stat["type"] == "error":
+                        st.error(f_stat["msg"])
+                    else:
+                        st.info(f_stat["msg"])
+
+            elif folder_mode == "➕ Create New Folder":
+                new_f_name = st.text_input(
+                    "New Folder Name",
+                    placeholder="e.g. Retail Discovery Briefs 2026",
+                    help="Creates a dedicated folder in Google Drive.",
+                )
+                if st.button("📁 Create & Select Folder", type="primary", width='stretch'):
+                    if new_f_name.strip():
+                        with st.spinner(f"Creating folder '{new_f_name.strip()}' in Google Drive..."):
+                            s_mail = st.session_state.get("share_recipient_email", "").strip() or None
+                            c_res = create_drive_folder(
+                                folder_name=new_f_name.strip(),
+                                oauth_credentials=oauth_creds if oauth_active else None,
+                                credentials_json=service_account_json_content,
+                                share_with_email=s_mail,
+                            )
+                        if c_res.get("success"):
+                            st.session_state["target_folder_id"] = c_res["id"]
+                            st.session_state["target_folder_name"] = f"📁 {c_res['name']}"
+                            st.session_state["target_folder_url"] = c_res.get("web_view_link", "")
+                            st.session_state["drive_folders_cache"] = None
+                            st.success(f"✅ Folder **{c_res['name']}** created and selected as destination!")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Failed to create folder: {c_res.get('error')}")
+                    else:
+                        st.warning("Please enter a folder name.")
+
+            # Active Folder Status Card
+            cur_id = st.session_state.get("target_folder_id", "")
+            cur_name = st.session_state.get("target_folder_name", "")
+            cur_url = st.session_state.get("target_folder_url", "")
+            st.markdown("---")
+            if cur_id:
+                link_markup = f" • [Open in Drive ↗]({cur_url})" if cur_url else ""
+                st.markdown(f"🎯 **Active Target:** `{cur_name or cur_id}`{link_markup}")
+            else:
+                st.markdown("🎯 **Active Target:** `My Drive (Default Root)`")
+
+        share_email_input = st.text_input(
+            "Share Directly with Email",
+            value=st.session_state.get("share_recipient_email", ""),
+            help="Enter your Google Workspace or Gmail address to grant edit access to the generated brief.",
+            placeholder="you@company.com",
+        )
+        st.session_state["share_recipient_email"] = share_email_input
 
     st.markdown("---")
-    st.subheader("3. Scraper Settings")
-    prefer_playwright = st.checkbox(
-        "Use Playwright Headless Browser",
-        value=True,
-        help="Renders dynamic client-side JS storefronts. Automatically falls back to HTTP requests if needed."
-    )
+    st.subheader("3. Playwright Headless Browser")
+    pw_available, pw_err_msg = check_playwright_availability()
+
+    if pw_available:
+        st.success("✅ **Playwright Headless Browser Active**")
+    else:
+        st.error(
+            f"❌ **Playwright Headless Browser Unavailable**\n\n"
+            f"The application requires Playwright Headless Browser to execute storefront discovery.\n\n"
+            f"**Error Details:** `{pw_err_msg}`"
+        )
+        if st.button("🔄 Restart / Install Playwright", type="primary", width="stretch"):
+            with st.spinner("Installing and restarting Playwright Chromium binaries..."):
+                p_ok, p_res = restart_playwright()
+            if p_ok:
+                st.success(f"✅ {p_res}")
+                st.rerun()
+            else:
+                st.error(f"❌ {p_res}")
+
+    prefer_playwright = pw_available
 
     st.markdown("---")
     st.caption("Retail Discovery Agent v2.0 • Powered by Google GenAI & Playwright")
@@ -282,12 +706,16 @@ with st.form("discovery_pipeline_form"):
             height=100
         )
 
-    submitted = st.form_submit_button("🚀 Run Pre-Sales Discovery Pipeline", type="primary", use_container_width=True)
+    submitted = st.form_submit_button("🚀 Run Pre-Sales Discovery Pipeline", type="primary", width='stretch')
 
 # -----------------------------------------------------------------------------
 # PIPELINE ORCHESTRATION & EXECUTION
 # -----------------------------------------------------------------------------
 if submitted:
+    if not pw_available:
+        st.error("❌ Cannot run discovery pipeline: Playwright Headless Browser is unavailable. Please click **'🔄 Restart / Install Playwright'** in the sidebar to fix.")
+        st.stop()
+
     if not domain_input.strip():
         st.error("Please provide a target retailer website domain.")
         st.stop()
@@ -299,12 +727,13 @@ if submitted:
     status_container = st.status("Executing Retail Pre-Sales Discovery Pipeline...", expanded=True)
 
     try:
-        # Step 1: Scrape storefront
-        status_container.write(f"🌐 Scraping storefront DOM and extracting retail tech signals from {domain_input}...")
+        # Step 1: Deep Crawl storefront, About Us, Leadership & Press Releases
+        status_container.write(f"🌐 Executing multi-page retail crawl (Storefront, About Us, Leadership, Press) on {domain_input}...")
         scrape_result = scrape_retail_site(
             url=domain_input.strip(),
-            prefer_playwright=prefer_playwright,
+            prefer_playwright=True,
             timeout_ms=30000,
+            deep_crawl=True,
         )
 
         careers_content = ""
@@ -312,14 +741,19 @@ if submitted:
             status_container.write(f"💼 Scraping careers & job signals from {careers_input}...")
             careers_res = scrape_retail_site(
                 url=careers_input.strip(),
-                prefer_playwright=False,  # Fast HTTP for careers
+                prefer_playwright=True,
                 timeout_ms=15000,
+                deep_crawl=False,
             )
             if careers_res.success:
                 careers_content = careers_res.markdown[:10000]
 
+        about_len = len(scrape_result.about_us_content.get("markdown_text", ""))
+        lead_len = len(scrape_result.leadership_content.get("markdown_text", ""))
+        press_count = len(scrape_result.press_releases)
         status_container.write(
-            f"✅ Scraped {len(scrape_result.markdown):,} chars of cleaned Markdown. "
+            f"✅ Crawled {len(scrape_result.markdown):,} chars Storefront, "
+            f"{about_len:,} chars About Us, {lead_len:,} chars Leadership, and {press_count} Press Releases. "
             f"Detected signals: {', '.join(scrape_result.tech_signals) or 'None'}"
         )
 
@@ -334,6 +768,9 @@ if submitted:
             annual_revenue=revenue_input.strip(),
             headcount=headcount_input.strip(),
             careers_content=careers_content,
+            about_us_content=scrape_result.about_us_content,
+            leadership_content=scrape_result.leadership_content,
+            press_releases=scrape_result.press_releases,
             api_key=api_key_input.strip(),
             model_name=model_choice,
             disable_ssl_verify=disable_ssl,
@@ -346,19 +783,44 @@ if submitted:
         markdown_brief = export_dossier_to_markdown(dossier)
 
         if google_creds_option != "Skip Google Docs (Local Markdown Only)":
-            status_container.write("📄 Exporting styled executive brief to Google Docs API...")
-            try:
-                doc_res = export_dossier_to_google_doc(
-                    dossier=dossier,
-                    credentials_json=service_account_json_content,
-                    folder_id=folder_id_input.strip() if folder_id_input else None,
-                    share_with_email=share_email_input.strip() if share_email_input else None,
+            raw_pasted = (st.session_state.get("pasted_folder_input") or st.session_state.get("raw_pasted_folder_input") or "").strip()
+            selected_fid = (
+                st.session_state.get("target_folder_id", "").strip()
+                or (extract_folder_id(raw_pasted) if raw_pasted else "")
+                or None
+            )
+            selected_email = st.session_state.get("share_recipient_email", "").strip() or None
+            sa_email_cur = st.session_state.get("service_account_client_email", "")
+            is_oauth_mode = google_creds_option.startswith("OAuth 2.0")
+            active_oauth = oauth_creds if (is_oauth_mode and oauth_creds and oauth_creds.valid) else None
+
+            if not selected_fid and not active_oauth and (service_account_json_content or sa_email_cur):
+                doc_export_error = (
+                    f"📁 **Google Drive Destination Folder Required**\n\n"
+                    f"Standalone Google Service Accounts do not have personal Google Drive storage (quota is **0 MB**). "
+                    f"Google blocks creating new documents directly at root 'My Drive'.\n\n"
+                    f"**How to resolve in 30 seconds:**\n"
+                    f"1. Open your [Google Drive](https://drive.google.com), create or open a folder (e.g. *Retail Discovery Briefs*).\n"
+                    f"2. Click **Share** and add `{sa_email_cur or 'your service account'}` as **Editor**.\n"
+                    f"3. In the sidebar under **'📁 Drive Destination & Folder Browser'**, click **🔄 Refresh** (or paste the folder link).\n"
+                    f"4. Click **'🔄 Retry Google Docs Upload'** below!"
                 )
-                google_doc_url = doc_res.get("document_url")
-                status_container.write(f"✅ Google Doc created: {google_doc_url}")
-            except Exception as doc_err:
-                doc_export_error = str(doc_err)
-                status_container.write(f"⚠️ Google Docs export note: {doc_export_error}")
+                status_container.write("⚠️ Google Docs export: destination folder required for Service Account.")
+            else:
+                status_container.write("📄 Exporting styled executive brief to Google Docs API...")
+                try:
+                    doc_res = export_dossier_to_google_doc(
+                        dossier=dossier,
+                        oauth_credentials=active_oauth,
+                        credentials_json=service_account_json_content,
+                        folder_id=selected_fid,
+                        share_with_email=selected_email,
+                    )
+                    google_doc_url = doc_res.get("document_url")
+                    status_container.write(f"✅ Google Doc created: {google_doc_url}")
+                except Exception as doc_err:
+                    doc_export_error = str(doc_err)
+                    status_container.write(f"⚠️ Google Docs export note: {doc_export_error}")
 
         status_container.update(label="🎉 Pre-Sales Discovery Pipeline Complete!", state="complete", expanded=False)
 
@@ -393,45 +855,36 @@ if "latest_dossier" in st.session_state:
 
     with cta_col1:
         if google_doc_url:
-            st.success("📄 **Live Google Doc Generated Successfully!**")
+            f_name_disp = st.session_state.get("target_folder_name")
+            f_url_disp = st.session_state.get("target_folder_url")
+            if f_name_disp and "[Default]" not in f_name_disp:
+                dest_str = f" inside folder **[{f_name_disp}]({f_url_disp})**" if f_url_disp else f" inside folder **{f_name_disp}**"
+            else:
+                dest_str = " in **Google Drive**"
+            st.success(f"📄 **Live Google Doc Generated Successfully!** Saved{dest_str}.")
             btn_col1, btn_col2 = st.columns([2, 1])
             with btn_col1:
                 st.link_button(
                     label="🚀 Open Formatted Google Doc Brief ↗",
                     url=google_doc_url,
                     type="primary",
-                    use_container_width=True,
+                    width='stretch',
                 )
             with btn_col2:
                 retry_upload_clicked = st.button(
                     "🔄 Retry Google Docs Upload",
-                    use_container_width=True,
+                    width='stretch',
                     help="Re-upload or update the Google Doc brief.",
                 )
         else:
             st.info("ℹ️ Google Doc export omitted or awaiting service account. Download the executive Markdown brief below, or retry uploading to Google Docs.")
             if doc_export_error:
-                if "403" in doc_export_error or "caller does not have permission" in doc_export_error.lower():
-                    proj = st.session_state.get("service_account_project_id", "")
-                    sa_acc = st.session_state.get("service_account_client_email", "")
-                    proj_param = f"?project={proj}" if proj else ""
-                    st.error(
-                        "🔒 **Google Cloud Permission Error (403: The caller does not have permission)**\n\n"
-                        "This occurs because the **Google Docs API** or **Google Drive API** is not enabled in your Google Cloud Project.\n\n"
-                        "**Quick Resolution Steps:**\n"
-                        f"1. 🔗 [**Enable Google Docs API**](https://console.cloud.google.com/apis/library/docs.googleapis.com{proj_param}) *(Click Enable)*\n"
-                        f"2. 🔗 [**Enable Google Drive API**](https://console.cloud.google.com/apis/library/drive.googleapis.com{proj_param}) *(Click Enable)*\n"
-                        "3. Once enabled, click **'🔄 Retry Google Docs Upload'** below!\n\n"
-                        f"*(Optional)*: If your Google Workspace restricts service accounts from creating files directly, "
-                        f"create a folder in Google Drive, share it with `{sa_acc or 'your service account'}` as Editor, and enter the **Folder ID** in the sidebar."
-                    )
-                else:
-                    st.error(f"⚠️ **Google Docs API Note:** {doc_export_error}")
+                st.error(doc_export_error)
 
             retry_upload_clicked = st.button(
                 "🔄 Retry Google Docs Upload",
                 type="primary",
-                use_container_width=False,
+                width='content',
                 help="Attempt to export the brief to Google Docs with current credentials.",
             )
 
@@ -442,21 +895,45 @@ if "latest_dossier" in st.session_state:
             data=markdown_brief,
             file_name=f"{safe_name}_Executive_Discovery_Brief.md",
             mime="text/markdown",
-            use_container_width=True,
+            width='stretch',
         )
 
     # Handle Retry Google Docs Upload action
     if retry_upload_clicked:
+        is_oauth_mode = google_creds_option.startswith("OAuth 2.0")
+        active_oauth = oauth_creds if (is_oauth_mode and oauth_creds and oauth_creds.valid) else None
+        creds_payload = service_account_json_content or st.session_state.get("service_account_json_content")
+        raw_pasted_retry = (st.session_state.get("pasted_folder_input") or st.session_state.get("raw_pasted_folder_input") or "").strip()
+        t_folder = (
+            st.session_state.get("target_folder_id", "").strip()
+            or (extract_folder_id(raw_pasted_retry) if raw_pasted_retry else "")
+            or None
+        )
+        s_email = st.session_state.get("share_recipient_email", "").strip() or None
+
+        # Pre-check: Service Accounts have 0 MB Drive quota and cannot create files at root 'My Drive'
+        if not t_folder and not active_oauth and (creds_payload or st.session_state.get("service_account_client_email")):
+            sa_acc = st.session_state.get("service_account_client_email", "your service account")
+            st.session_state["doc_export_error"] = (
+                f"📁 **Google Drive Destination Folder Required**\n\n"
+                f"Standalone Google Service Accounts do not have personal Google Drive storage (quota is **0 MB**). "
+                f"Google blocks creating new documents directly at root 'My Drive'.\n\n"
+                f"**How to resolve in 30 seconds:**\n"
+                f"1. Open your [Google Drive](https://drive.google.com), create or open a folder (e.g. *Retail Discovery Briefs*).\n"
+                f"2. Click **Share** on that folder, add `{sa_acc}` as **Editor**, and save.\n"
+                f"3. In the sidebar under **'📁 Drive Destination & Folder Browser'**, click **🔄 Refresh** (or paste the folder URL).\n"
+                f"4. Click **'🔄 Retry Google Docs Upload'**!"
+            )
+            st.rerun()
+
         with st.spinner(f"Exporting Executive Discovery Brief for {dossier.account_name} to Google Docs..."):
             try:
-                creds_payload = service_account_json_content or st.session_state.get("service_account_json_content")
-                t_folder = folder_id_input.strip() if folder_id_input else st.session_state.get("target_folder_id", "").strip()
-                s_email = share_email_input.strip() if share_email_input else st.session_state.get("share_recipient_email", "").strip()
                 doc_res = export_dossier_to_google_doc(
                     dossier=dossier,
+                    oauth_credentials=active_oauth,
                     credentials_json=creds_payload,
-                    folder_id=t_folder or None,
-                    share_with_email=s_email or None,
+                    folder_id=t_folder,
+                    share_with_email=s_email,
                 )
                 st.session_state["google_doc_url"] = doc_res.get("document_url")
                 st.session_state["doc_export_error"] = None
@@ -561,10 +1038,52 @@ if "latest_dossier" in st.session_state:
 
     # Tab 6: Scraped Signals
     with tab6:
-        st.subheader("Scraped Signals & DOM Summary")
+        st.subheader("Deep Corporate Intelligence & Scraped DOM Signals")
         if raw_scrape:
-            st.markdown(f"- **Title:** {raw_scrape.title}")
-            st.markdown(f"- **Engine Used:** `{raw_scrape.engine_used}`")
-            st.markdown(f"- **Meta Description:** {raw_scrape.meta_description}")
-            st.markdown(f"- **Detected Signatures:** `{', '.join(raw_scrape.tech_signals)}`")
-            st.text_area("Cleaned Markdown Content", value=raw_scrape.markdown[:10000], height=400)
+            st.markdown(
+                f"- **Domain Title:** {raw_scrape.title}\n"
+                f"- **Engine Used:** `{raw_scrape.engine_used}`\n"
+                f"- **Meta Description:** {raw_scrape.meta_description or 'None'}\n"
+                f"- **Detected Platform & Tooling Signatures:** `{', '.join(raw_scrape.tech_signals) or 'None'}`"
+            )
+
+            # Sub-section 1: About Us & Milestones
+            with st.expander("🏢 **Company About Us & Key Milestones**", expanded=True):
+                about = getattr(raw_scrape, "about_us_content", {}) or {}
+                if about.get("source_url"):
+                    st.caption(f"Source: [{about['source_url']}]({about['source_url']})")
+                key_facts = about.get("key_facts", [])
+                if key_facts:
+                    st.markdown("**Structured Key Facts & Operational Metrics:**")
+                    for kf in key_facts:
+                        st.markdown(f"- {kf}")
+                if about.get("markdown_text"):
+                    st.markdown("**About Us Narrative:**")
+                    st.markdown(about["markdown_text"][:4000])
+                elif not key_facts:
+                    st.info("No dedicated About Us sub-page resolved for this domain.")
+
+            # Sub-section 2: Executive Leadership Profiles
+            with st.expander("👥 **Executive Leadership Notes**", expanded=True):
+                lead = getattr(raw_scrape, "leadership_content", {}) or {}
+                if lead.get("source_url"):
+                    st.caption(f"Source: [{lead['source_url']}]({lead['source_url']})")
+                if lead.get("markdown_text"):
+                    st.markdown(lead["markdown_text"][:4000])
+                else:
+                    st.info("No dedicated Leadership/Executive sub-page resolved for this domain.")
+
+            # Sub-section 3: Corporate Press Releases & Earnings
+            with st.expander("📰 **Corporate Press Releases & Newsroom Digest**", expanded=True):
+                press_list = getattr(raw_scrape, "press_releases", []) or []
+                if press_list:
+                    for pr in press_list:
+                        st.markdown(f"#### [{pr.get('title', 'Corporate Release')}]({pr.get('source_url', '#')})")
+                        st.markdown(pr.get("markdown_text", "")[:1000])
+                        st.markdown("---")
+                else:
+                    st.info("No corporate press releases or newsroom articles resolved for this domain.")
+
+            # Sub-section 4: Clean Storefront Markdown
+            with st.expander("🌐 **Storefront DOM (Clean Markdown)**", expanded=False):
+                st.text_area("Storefront Cleaned Content", value=raw_scrape.markdown[:10000], height=350)

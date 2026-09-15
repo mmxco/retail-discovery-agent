@@ -7,6 +7,8 @@ specialized in detecting retail ERP, POS, and omnichannel inventory pain points.
 
 import os
 import json
+import time
+import random
 import logging
 from typing import Optional, List, Dict, Any
 
@@ -33,11 +35,14 @@ logger = logging.getLogger(__name__)
 BRIEF_SYSTEM_INSTRUCTION = """
 You are a Principal Solutions Engineer and Enterprise Retail Architect specializing in modern retail enterprise systems, including Tier-1 Retail ERP, modern Point of Sale (POS), Distributed Order Management (DOM), and Unified Commerce architectures.
 
-Analyze the provided retailer domain, scraped website content, detected technology stack indicators, and CRM context using the B.R.I.E.F. Framework:
+Analyze the provided retailer domain, scraped website content, detected technology stack indicators, company About Us intelligence, executive leadership profiles, corporate press releases, and CRM context using the B.R.I.E.F. Framework:
 
-1. B - BASELINE:
+1. B - BASELINE & EXECUTIVE SUMMARY FORMULA:
    - Identify the retailer's commercial identity, market tier, retail segment, and estimated business scale (store count, employee headcount, revenue bracket).
-   - Synthesize an authoritative 2-3 paragraph Executive Summary explaining their retail posture and why they are prime for pre-sales engagement.
+   - Synthesize an authoritative 2-3 paragraph Executive Summary strictly following this 3-part formula:
+     * Paragraph 1 (Heritage, Mission & Operational Scale): Ground in the provided About Us intelligence (founding context, brand heritage, core mission, physical store footprint, and retail operating model).
+     * Paragraph 2 (Strategic Trajectory, Hard Numbers & Initiatives): Directly cite recent quarterly/annual results, financial metrics, DTC growth rates, or logistics/store fulfillment rollouts extracted from Corporate Press Releases and earnings announcements.
+     * Paragraph 3 (Architectural Urgency & Named Leadership Mandate): Bridge the identified technology stack compromises (e.g., monolithic legacy ERP, batch POS sync latency, disconnected OMS) to the explicit operational remit of named executives from the Leadership Notes (e.g., CIO, VP of Merchandising, VP of Supply Chain), articulating why enterprise modernization is an immediate pre-sales priority.
 
 2. R - RETAIL GAPS (ERP, POS, OMS, Inventory):
    - Scrutinize the technical footprint and public signals for common enterprise friction points:
@@ -82,6 +87,9 @@ def build_analysis_prompt(
     annual_revenue: Optional[str] = "",
     headcount: Optional[str] = "",
     careers_content: Optional[str] = "",
+    about_us_content: Optional[Dict[str, Any]] = None,
+    leadership_content: Optional[Dict[str, Any]] = None,
+    press_releases: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Constructs the comprehensive prompt payload for Gemini 2.5 Flash."""
     # Truncate markdown to ~25,000 characters if exceptionally large to preserve token focus
@@ -99,6 +107,22 @@ def build_analysis_prompt(
         "detected_technology_signals": tech_signals,
         "scraped_storefront_markdown": truncated_markdown,
     }
+
+    if about_us_content and (about_us_content.get("markdown_text") or about_us_content.get("key_facts")):
+        payload["company_about_us_intelligence"] = {
+            "source_url": about_us_content.get("source_url", ""),
+            "key_facts_and_milestones": about_us_content.get("key_facts", []),
+            "narrative_markdown": (about_us_content.get("markdown_text", "")[:10000]),
+        }
+
+    if leadership_content and leadership_content.get("markdown_text"):
+        payload["executive_leadership_profiles"] = {
+            "source_url": leadership_content.get("source_url", ""),
+            "profiles_markdown": leadership_content.get("markdown_text", "")[:10000],
+        }
+
+    if press_releases:
+        payload["corporate_press_releases_and_earnings"] = press_releases[:5]
 
     if truncated_careers:
         payload["careers_job_postings_signals"] = truncated_careers
@@ -119,6 +143,9 @@ def analyze_retail_prospect(
     annual_revenue: Optional[str] = "",
     headcount: Optional[str] = "",
     careers_content: Optional[str] = "",
+    about_us_content: Optional[Dict[str, Any]] = None,
+    leadership_content: Optional[Dict[str, Any]] = None,
+    press_releases: Optional[List[Dict[str, str]]] = None,
     api_key: Optional[str] = None,
     model_name: str = "gemini-2.5-flash",
     disable_ssl_verify: bool = False,
@@ -151,6 +178,9 @@ def analyze_retail_prospect(
         annual_revenue=annual_revenue,
         headcount=headcount,
         careers_content=careers_content,
+        about_us_content=about_us_content,
+        leadership_content=leadership_content,
+        press_releases=press_releases,
     )
 
     logger.info(f"Invoking {model_name} with structured output for {account_name or domain}...")
@@ -160,26 +190,46 @@ def analyze_retail_prospect(
         response_schema=DiscoveryDossier,
         temperature=0.2,
         system_instruction=BRIEF_SYSTEM_INSTRUCTION,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=user_prompt,
-            config=config,
-        )
-    except Exception as e:
-        err_msg = str(e).lower()
-        if ("certificate_verify_failed" in err_msg or "certificate verify failed" in err_msg or "ssl" in err_msg) and not disable_ssl_verify:
-            logger.warning(f"SSL certificate verification failed ({e}). Retrying with SSL verification bypass...")
-            fallback_opts = types.HttpOptions(client_args={"verify": False})
-            fallback_client = genai.Client(api_key=resolved_api_key, http_options=fallback_opts)
-            response = fallback_client.models.generate_content(
+    max_retries = 3
+    base_delay = 2.0
+    active_client = client
+    response = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = active_client.models.generate_content(
                 model=model_name,
                 contents=user_prompt,
                 config=config,
             )
-        else:
+            break
+        except Exception as e:
+            err_msg = str(e).lower()
+
+            # Handle SSL certificate verification failure
+            if ("certificate_verify_failed" in err_msg or "certificate verify failed" in err_msg or "ssl" in err_msg) and not disable_ssl_verify:
+                logger.warning(f"SSL certificate verification failed ({e}). Retrying with SSL verification bypass...")
+                fallback_opts = types.HttpOptions(client_args={"verify": False})
+                active_client = genai.Client(api_key=resolved_api_key, http_options=fallback_opts)
+                continue
+
+            # Check for Rate Limit (429, RESOURCE_EXHAUSTED) or Temporary Unavailable (503)
+            is_rate_limit = ("429" in err_msg or "resource_exhausted" in err_msg or "rate limit" in err_msg or "quota" in err_msg)
+            is_transient = ("503" in err_msg or "unavailable" in err_msg or "overloaded" in err_msg)
+
+            if (is_rate_limit or is_transient) and attempt < max_retries:
+                backoff_delay = (base_delay * (2 ** attempt)) + random.uniform(0.1, 0.5)
+                reason = "Rate limit / quota exceeded (429)" if is_rate_limit else "Service temporarily unavailable (503)"
+                logger.warning(
+                    f"{reason} on attempt {attempt + 1}/{max_retries + 1}. Backing off for {backoff_delay:.2f}s before retry..."
+                )
+                time.sleep(backoff_delay)
+                continue
+
+            logger.error(f"Gemini generation failed after {attempt + 1} attempts: {e}")
             raise
 
     # Validate and deserialize response into DiscoveryDossier
