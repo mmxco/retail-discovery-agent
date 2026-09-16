@@ -5,6 +5,7 @@
 [![Google GenAI SDK](https://img.shields.io/badge/Google_GenAI-Gemini_2.5_Flash-8E75B2.svg)](https://ai.google.dev/)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-green.svg)](https://playwright.dev/)
 [![Pydantic V2](https://img.shields.io/badge/Pydantic-V2-E92063.svg)](https://docs.pydantic.dev/)
+[![Tests](https://img.shields.io/badge/pytest-70_passed-brightgreen.svg)](https://docs.pytest.org/)
 
 An enterprise-grade Pre-Sales Discovery Pipeline engineered for Solution Engineers (SEs) and Account Executives (AEs) selling into Tier-1 and Tier-2 retail enterprises. 
 
@@ -14,29 +15,28 @@ The agent automatically crawls prospect storefronts, isolates architectural sign
 
 ## Architecture Overview
 
-The system is decomposed into five decoupled, testable modules:
+The system is decomposed into clean, modular layers adhering to separation of concerns:
 
 ```mermaid
 flowchart TD
-    subgraph Ingestion
-        A["Prospect Domain & CRM Notes"] --> B["scraper.py<br/>(Playwright Headless Browser)"]
+    subgraph Ingestion ["Ingestion (services/crawler)"]
+        A["Prospect Domain & CRM Notes"] --> B["crawler.py<br/>(Async Playwright + Event-Loop Runner)"]
+        B --> C["sanitizer.py<br/>(DOMSanitizer + Clean Markdown)"]
+        B --> D["signatures.py<br/>(E-Commerce & Tech Signatures)"]
     end
 
-    subgraph Extraction
-        B --> C["DOM Tag Decomposition<br/>(Strip nav, footer, scripts, cookie modals)"]
-        C --> D["Tech Signature Scanner<br/>(Shopify, Salesforce, SAP, Oracle, GA4)"]
-        D --> E["Clean ATX Markdown<br/>(markdownify)"]
+    subgraph Intelligence ["Intelligence (core/ & services/discovery)"]
+        C --> E["analyzer.py & erp.py<br/>(B.R.I.E.F. Synthesis)"]
+        D --> E
+        E --> F["core/gemini.py<br/>(Unified GenAI Client + SSL / Retries)"]
+        F --> G["core/models.py<br/>(Strict Pydantic V2 Contracts)"]
     end
 
-    subgraph Intelligence
-        E --> F["analyzer.py<br/>(Gemini 2.5 Flash + B.R.I.E.F. Prompt)"]
-        F --> G["DiscoveryDossier<br/>(models.py Pydantic V2 Schema)"]
-    end
-
-    subgraph Delivery
-        G --> H["exporter.py<br/>(Google Docs API Batch Update)"]
-        G --> I["app.py<br/>(Streamlit Interactive Dashboard)"]
+    subgraph Delivery ["Delivery (services/google, exporters, ui)"]
+        G --> H["services/google/<br/>(OAuth, Drive & Docs Builders)"]
+        G --> I["ui/<br/>(Streamlit Modular UI Controllers)"]
         H --> J["Formatted Google Doc Brief"]
+        I --> K["app.py<br/>(Thin Streamlit Coordinator)"]
     end
 ```
 
@@ -79,9 +79,72 @@ sequenceDiagram
 
 ---
 
-## Core Modules
+## Directory Structure
 
-### 1. `models.py` — Pydantic V2 Account Intelligence Contracts
+```
+retail-discovery-agent/
+│
+├── core/                              # Central system kernel & data contracts
+│   ├── config.py                      # Central configuration, timeouts, paths & logging
+│   ├── exceptions.py                  # Standardized exception hierarchy
+│   ├── gemini.py                      # Shared GenAI client (SSL fallback, backoff, schemas)
+│   └── models.py                      # Single source of truth for all Pydantic V2 schemas
+│
+├── services/                          # Decoupled domain service engines
+│   ├── crawler/
+│   │   ├── crawler.py                 # Async Playwright crawler with thread-pool runner
+│   │   ├── sanitizer.py               # Unified DOMSanitizer & markdown conversion
+│   │   └── signatures.py              # Retail tech footprint detection patterns
+│   │
+│   ├── discovery/
+│   │   ├── analyzer.py                # Prospect analysis & B.R.I.E.F. synthesis
+│   │   ├── erp.py                     # Legacy ERP & inventory sync specialist
+│   │   └── pipeline.py                # High-level discovery pipeline orchestrator
+│   │
+│   └── google/
+│       ├── oauth.py                   # Local OAuth server & credential lifecycle
+│       ├── drive.py                   # Drive folder CRUD & error diagnostics
+│       └── docs.py                    # Google Docs briefing document builder
+│
+├── auth/                              # Authentication interfaces
+│   └── google_oauth.py                # Backward-compatible OAuth adapter
+│
+├── integrations/                      # Cloud integrations
+│   └── drive_service.py               # Drive service client adapter
+│
+├── exporters/                         # Document & report exporters
+│   ├── gdocs_exporter.py              # Google Docs batchUpdate export engine
+│   └── markdown_exporter.py           # ATX Markdown export engine
+│
+├── ui/                                # Modular Streamlit UI components
+│   ├── sidebar.py                     # Auth, API keys & environment panel
+│   ├── form.py                        # Account inputs, scenario presets & profile save/load
+│   └── tabs.py                        # Modular dossier tab views & metrics renderers
+│
+├── tests/                             # Comprehensive automated test suite (70 tests)
+│   ├── conftest.py                    # Pytest fixtures and mock factories
+│   ├── test_analyzer.py               # Discovery & B.R.I.E.F. synthesis tests
+│   ├── test_crawler.py                # Crawler & DOM sanitizer unit tests
+│   ├── test_drive.py                  # Drive API integration tests
+│   ├── test_exporters.py              # Google Docs & Markdown export tests
+│   ├── test_gemini.py                 # Unified GenAI client & retry tests
+│   ├── test_legacy_erp.py             # ERP extraction & schema validation tests
+│   ├── test_models.py                 # Pydantic V2 contract integrity tests
+│   ├── test_oauth.py                  # OAuth credential handling tests
+│   ├── test_persistence.py            # Account profile persistence tests
+│   └── test_ui.py                     # Streamlit component tests
+│
+├── app.py                             # Thin Streamlit entry point (178 lines)
+├── profile_manager.py                 # Account profile manager interface
+├── requirements.txt                   # Production dependencies
+└── pytest.ini                         # Pytest configuration
+```
+
+---
+
+## Core Modules & Capabilities
+
+### 1. `core/models.py` — Pydantic V2 Account Intelligence Contracts
 Strict schema validation and data serialization for account intelligence:
 - **`DiscoveryDossier`**: Primary briefing object consolidating firmographics, scale, executive summary, tech stack, pain points, discovery questions, and engagement strategy.
 - **`TechStackIndicators`**: Tracks e-commerce platform, in-store POS, core merchandising ERP, distributed order management (DOM/OMS), warehouse supply chain (WMS), customer analytics, and architectural signals.
@@ -92,37 +155,31 @@ Strict schema validation and data serialization for account intelligence:
   - `affected_executives`: Impacted retail leaders (VP Merchandising, CIO, etc.).
 - **`DiscoveryQuestions`**: Persona-specific discovery questions with `what_to_listen_for` cues and the `value_wedge` against legacy monolithic suites.
 
-### 2. `scraper.py` — Playwright Scraper & DOM Cleaner
-High-resilience scraping pipeline designed for JavaScript-heavy modern retail storefronts:
-- **DOM Decomposition**: Completely strips non-content elements (`<nav>`, `<footer>`, `<script>`, `<style>`, `<noscript>`, `<svg>`, `<aside>`, `<iframe>`, forms, buttons, inputs, dialogs) and cookie/consent banners (`onetrust`, `gdpr`, `cookie-banner`).
-- **Tech Footprint Detection**: Scans script and stylesheet sources prior to DOM decomposition to identify platforms like Shopify Plus, Salesforce Commerce Cloud, SAP Commerce, Oracle Retail, Magento, Segment, Klaviyo, and Bloomreach.
-- **Clean Markdown Conversion**: Utilizes `markdownify` with ATX heading styles (`#`, `##`), collapsing whitespace and formatting headers cleanly for optimal token usage.
-- **Automatic HTTP Fallback**: Seamlessly falls back to an HTTP session with retries if headless browser execution is unavailable.
+### 2. `core/gemini.py` — Unified LLM Client Service
+- Centralized `GeminiClient` wrapping the official `google-genai` SDK.
+- Handles client instantiation, automatic SSL fallback for enterprise corporate proxies, exponential backoff on `ResourceExhausted` (HTTP 429) rate limits, and schema-constrained structured output generation (`response_schema=...`).
 
-### 3. `analyzer.py` — Gemini 2.5 Flash B.R.I.E.F. Engine
-Coordinates structured AI synthesis using the official `google-genai` SDK:
-- **Model**: `gemini-2.5-flash` with low temperature (`0.2`).
-- **Structured Output**: `config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=DiscoveryDossier)` ensuring 100% schema adherence.
-- **B.R.I.E.F. Methodology**:
-  - **B - Baseline**: Firmographics, market positioning, and existing tech footprint.
-  - **R - Retail Gaps**: Architectural friction points across POS-to-ERP latency, unified inventory, allocation, and store ops.
-  - **I - Impact**: Value Triangle quantification (Technical Gap $\rightarrow$ Operational Friction $\rightarrow$ Financial Impact).
-  - **E - Engagement Questions**: Executive questions per persona with target listening cues.
-  - **F - Forward Strategy**: Tactical pre-sales positioning and entry wedge.
-- **Enterprise SSL Resilience**: Automatically integrates `truststore` to resolve native Windows/macOS certificate stores, with auto-retry on corporate proxy SSL inspection.
+### 3. `services/crawler/` — Async Playwright Scraper & DOM Sanitizer
+- **Async Execution**: Pure `async_playwright` implementation backed by a robust `run_async` thread-pool executor for safe invocation from synchronous callers (Streamlit, Celery).
+- **DOM Sanitization**: `DOMSanitizer` decomposes non-content elements (`<nav>`, `<footer>`, `<script>`, `<style>`, modals, cookie banners) and converts DOM structures into clean ATX Markdown.
+- **Tech Footprint Scanner**: Regex-based detection matching signatures across Shopify Plus, Salesforce Commerce Cloud, SAP Commerce, Oracle Retail, Magento, GA4, Klaviyo, and Bloomreach.
 
-### 4. `exporter.py` — Google Docs API Exporter
-Builds and styles an executive pre-discovery briefing in Google Docs:
-- Uses `GoogleDocsBriefBuilder` to track character offsets and generate batchUpdate requests for `TITLE`, `SUBTITLE`, `HEADING_1`, `HEADING_2`, bolding, and custom navy/slate palette colors.
-- Supports Service Account credentials, OAuth user tokens, or Google Application Default Credentials (ADC).
-- Includes `export_dossier_to_markdown` for immediate local download if Google Docs credentials are not configured.
+### 4. `services/discovery/` — B.R.I.E.F. Synthesis Engine
+Coordinates structured AI synthesis using Gemini 2.5 Flash:
+- **B - Baseline**: Firmographics, market positioning, and existing tech footprint.
+- **R - Retail Gaps**: Architectural friction points across POS-to-ERP latency, unified inventory, allocation, and store ops.
+- **I - Impact**: Value Triangle quantification (Technical Gap $\rightarrow$ Operational Friction $\rightarrow$ Financial Impact).
+- **E - Engagement Questions**: Executive questions per persona with target listening cues.
+- **F - Forward Strategy**: Tactical pre-sales positioning and entry wedge.
 
-### 5. `app.py` — Streamlit Discovery Studio
-Interactive web UI providing:
-- **Preset Scenarios**: Quick-load demonstration scenarios for Target, Nordstrom, Williams-Sonoma, or blank canvas.
-- **Live Pipeline Feedback**: `st.status` widget updating step-by-step through DOM scraping, tech detection, Gemini 2.5 Flash synthesis, and Google Docs export.
-- **Direct Link Button**: One-click action button opening the created Google Doc directly (`Open Formatted Google Doc Brief ↗`).
-- **6-Tab Dossier Viewer**: Executive Overview, Tech Stack, Value Triangle Pain Points, Persona Questions, Recommended Strategy, and Raw Scraped Signals.
+### 5. `services/google/` & Exporters
+- **Google Docs API Builder**: Character-offset batch updates formatting titles, headings, callouts, tables, and palette colors.
+- **Desktop OAuth Flow**: Local web server loop handling developer token authorization and refreshing.
+- **Markdown Exporter**: Instant offline export to ATX Markdown files.
+
+### 6. `ui/` & `app.py` — Modular Streamlit UI
+- `app.py` serves as a clean 178-line routing coordinator.
+- Discrete UI controllers manage sidebar settings (`ui/sidebar.py`), profile form inputs and presets (`ui/form.py`), and 6-tab dossier visualizers (`ui/tabs.py`).
 
 ---
 
@@ -185,14 +242,29 @@ Open your browser to `http://localhost:8501`.
 
 ---
 
+## Automated Test Suite
+
+The repository includes a comprehensive, hermetic test suite with **70 automated tests** covering all modules without requiring live network, external browsers, or active Google credentials:
+
+```bash
+# Run all tests
+pytest
+
+# Run tests with verbose output
+pytest tests/ test_extraction.py -v
+```
+
+---
+
 ## Programmatic Usage
 
-You can also import and use the pipeline directly in your Python code, workflows, or backend APIs:
+You can import and use the pipeline directly in your Python code or backend services:
 
 ```python
-from scraper import scrape_retail_site
-from analyzer import analyze_retail_prospect
-from exporter import export_dossier_to_google_doc, export_dossier_to_markdown
+from services.crawler.crawler import scrape_retail_site
+from services.discovery.analyzer import analyze_retail_prospect
+from exporters.gdocs_exporter import export_dossier_to_google_doc
+from exporters.markdown_exporter import export_dossier_to_markdown
 
 # 1. Scrape storefront
 scrape_result = scrape_retail_site("https://target.com", prefer_playwright=True)
@@ -221,3 +293,4 @@ print(f"Created Google Doc: {doc_info['document_url']}")
 ## License
 
 Apache-2.0. See `LICENSE` for details.
+
